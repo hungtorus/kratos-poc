@@ -24,6 +24,8 @@ const (
 	TableRevokedJTI  = "poc_revoked_jti"
 	TableOIDCCtx     = "poc_oidc_ctx"
 	TableOIDCState   = "poc_oidc_state"
+	TableBrokerAuth  = "poc_telegram_broker_auth"
+	TableBrokerCode  = "poc_telegram_broker_code"
 )
 
 type Store struct {
@@ -61,6 +63,37 @@ type OIDCStateRecord struct {
 	TTL         int64  `dynamodbav:"ttl"`
 }
 
+// BrokerAuthorization is persisted between the broker's public authorization
+// endpoint and its Telegram callback. It is consumed exactly once.
+type BrokerAuthorization struct {
+	UpstreamState string `dynamodbav:"upstream_state"`
+	ClientID      string `dynamodbav:"client_id"`
+	RedirectURI   string `dynamodbav:"redirect_uri"`
+	ClientState   string `dynamodbav:"client_state"`
+	Scope         string `dynamodbav:"scope"`
+	Nonce         string `dynamodbav:"nonce"` // nonce supplied by Kratos
+	UpstreamNonce string `dynamodbav:"upstream_nonce"`
+	CodeChallenge string `dynamodbav:"code_challenge"`
+	CodeMethod    string `dynamodbav:"code_method"`
+	CodeVerifier  string `dynamodbav:"code_verifier"`
+	TTL           int64  `dynamodbav:"ttl"`
+}
+
+// BrokerCode is an opaque authorization code record, consumed atomically by
+// the broker token endpoint. DynamoDB's TTL is cleanup only; TTL is checked
+// at read time because DynamoDB expiration is asynchronous.
+type BrokerCode struct {
+	Code          string         `dynamodbav:"code"`
+	ClientID      string         `dynamodbav:"client_id"`
+	RedirectURI   string         `dynamodbav:"redirect_uri"`
+	CodeChallenge string         `dynamodbav:"code_challenge"`
+	CodeMethod    string         `dynamodbav:"code_method"`
+	Nonce         string         `dynamodbav:"nonce"`
+	Subject       string         `dynamodbav:"subject"`
+	Claims        map[string]any `dynamodbav:"claims"`
+	TTL           int64          `dynamodbav:"ttl"`
+}
+
 func New(ctx context.Context, endpoint, region, salt string) (*Store, error) {
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(region),
@@ -92,6 +125,8 @@ func (s *Store) ensureTables(ctx context.Context) error {
 		{TableRevokedJTI, "jti", true},
 		{TableOIDCCtx, "ctx_id", true},
 		{TableOIDCState, "short_state", true},
+		{TableBrokerAuth, "upstream_state", true},
+		{TableBrokerCode, "code", true},
 	}
 	for _, t := range tables {
 		_, err := s.client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(t.name)})
@@ -295,6 +330,80 @@ func (s *Store) ConsumeOIDCState(ctx context.Context, shortState string) (string
 		Key:       map[string]types.AttributeValue{"short_state": &types.AttributeValueMemberS{Value: shortState}},
 	})
 	return rec.KratosState, nil
+}
+
+func (s *Store) SaveBrokerAuthorization(ctx context.Context, rec BrokerAuthorization) error {
+	rec.TTL = time.Now().Add(10 * time.Minute).Unix()
+	item, err := attributevalue.MarshalMap(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(TableBrokerAuth), Item: item})
+	return err
+}
+
+func (s *Store) ConsumeBrokerAuthorization(ctx context.Context, upstreamState string) (*BrokerAuthorization, error) {
+	out, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:    aws.String(TableBrokerAuth),
+		Key:          map[string]types.AttributeValue{"upstream_state": &types.AttributeValueMemberS{Value: upstreamState}},
+		ReturnValues: types.ReturnValueAllOld,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Attributes == nil {
+		return nil, fmt.Errorf("broker authorization not found")
+	}
+	var rec BrokerAuthorization
+	if err := attributevalue.UnmarshalMap(out.Attributes, &rec); err != nil {
+		return nil, err
+	}
+	if rec.TTL < time.Now().Unix() {
+		return nil, fmt.Errorf("broker authorization expired")
+	}
+	return &rec, nil
+}
+
+func (s *Store) SaveBrokerCode(ctx context.Context, rec BrokerCode) error {
+	rec.TTL = time.Now().Add(2 * time.Minute).Unix()
+	item, err := attributevalue.MarshalMap(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.client.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(TableBrokerCode), Item: item})
+	return err
+}
+
+func (s *Store) ConsumeBrokerCode(ctx context.Context, code, clientID string) (*BrokerCode, error) {
+	out, err := s.client.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(TableBrokerCode),
+		Key:       map[string]types.AttributeValue{"code": &types.AttributeValueMemberS{Value: code}},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if out.Item == nil {
+		return nil, fmt.Errorf("broker authorization code not found")
+	}
+	var rec BrokerCode
+	if err := attributevalue.UnmarshalMap(out.Item, &rec); err != nil {
+		return nil, err
+	}
+	if rec.TTL < time.Now().Unix() {
+		return nil, fmt.Errorf("broker authorization code expired")
+	}
+	_, err = s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName:           aws.String(TableBrokerCode),
+		Key:                 map[string]types.AttributeValue{"code": &types.AttributeValueMemberS{Value: code}},
+		ConditionExpression: aws.String("attribute_exists(code) AND client_id = :client_id"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":client_id": &types.AttributeValueMemberS{Value: clientID},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("consume broker authorization code: %w", err)
+	}
+	return &rec, nil
 }
 
 func (s *Store) RevokeJTI(ctx context.Context, jti string, exp time.Time) error {

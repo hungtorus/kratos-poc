@@ -1,4 +1,4 @@
-const state = { flowRef: null, totpFlowRef: null, stepupFlowRef: null };
+const state = { flowRef: null, totpFlowRef: null, stepupFlowRef: null, session: null };
 const SESSION_KEY = 'poc_kratos_session';
 
 function getSessionToken() {
@@ -78,6 +78,7 @@ async function refreshSession() {
   if (s.session_token) setSessionToken(s.session_token);
   else if (!s.authenticated) setSessionToken('');
   updateAuthBanner(s);
+  state.session = s.authenticated ? s : null;
   document.getElementById('session-view').textContent = JSON.stringify(s, null, 2);
   showJWT(s.jwt);
   try {
@@ -142,7 +143,9 @@ async function startOIDC(provider, intent) {
 
 function parseCreationOptions(raw) {
   if (!raw) return raw;
-  if (raw.credentialOptions) return raw.credentialOptions;
+  // Kratos registration wraps options; login returns publicKey at top level.
+  if (raw.credentialOptions?.publicKey) return raw.credentialOptions.publicKey;
+  if (raw.publicKey) return raw.publicKey;
   return raw;
 }
 
@@ -161,39 +164,52 @@ function base64URLToBuffer(b64) {
   return buf.buffer;
 }
 
-function prepOptions(opts, forCreate) {
+function prepOptions(opts, forCreate, displayName) {
   const o = structuredClone(opts);
   if (o.challenge) o.challenge = base64URLToBuffer(o.challenge);
-  if (o.user && o.user.id) o.user.id = base64URLToBuffer(o.user.id);
+  if (o.user?.id) o.user.id = base64URLToBuffer(o.user.id);
+  if (forCreate && displayName && o.user) {
+    o.user.name = displayName;
+    o.user.displayName = displayName;
+  }
   if (!forCreate && o.allowCredentials) {
     o.allowCredentials = o.allowCredentials.map(c => ({ ...c, id: base64URLToBuffer(c.id) }));
   }
   return o;
 }
 
-function credToJSON(cred) {
-  const r = {
+function encodeBufferField(value) {
+  if (value == null) return '';
+  return bufferToBase64URL(value);
+}
+
+function credCreateToJSON(cred) {
+  return {
     id: cred.id,
-    rawId: bufferToBase64URL(cred.rawId),
+    rawId: encodeBufferField(cred.rawId),
     type: cred.type,
     response: {
-      clientDataJSON: bufferToBase64URL(cred.response.clientDataJSON),
+      attestationObject: encodeBufferField(cred.response.attestationObject),
+      clientDataJSON: encodeBufferField(cred.response.clientDataJSON),
     },
     clientExtensionResults: cred.getClientExtensionResults?.() || {},
   };
-  if (cred.response.attestationObject) {
-    r.response.attestationObject = bufferToBase64URL(cred.response.attestationObject);
-  }
-  if (cred.response.authenticatorData) {
-    r.response.authenticatorData = bufferToBase64URL(cred.response.authenticatorData);
-  }
-  if (cred.response.signature) {
-    r.response.signature = bufferToBase64URL(cred.response.signature);
-  }
-  if (cred.response.userHandle) {
-    r.response.userHandle = bufferToBase64URL(cred.response.userHandle);
-  }
-  return r;
+}
+
+function credGetToJSON(cred) {
+  // Match Kratos webauthn.js: login lookup uses response.userHandle.
+  return {
+    id: cred.id,
+    rawId: encodeBufferField(cred.rawId),
+    type: cred.type,
+    response: {
+      authenticatorData: encodeBufferField(cred.response.authenticatorData),
+      clientDataJSON: encodeBufferField(cred.response.clientDataJSON),
+      signature: encodeBufferField(cred.response.signature),
+      userHandle: encodeBufferField(cred.response.userHandle),
+    },
+    clientExtensionResults: cred.getClientExtensionResults?.() || {},
+  };
 }
 
 async function startEmailOTP(intent) {
@@ -214,29 +230,65 @@ document.getElementById('btn-email-verify').onclick = async () => {
   await refreshSession();
 };
 
-document.getElementById('btn-passkey-register').onclick = async () => {
-  const email = document.getElementById('email').value;
-  const { flow_ref, creation_options } = await api('/api/v1/auth/passkey/register/start', {
-    method: 'POST', body: JSON.stringify({ email }),
-  });
-  const opts = prepOptions(parseCreationOptions(creation_options), true);
+async function runPasskeyCreate(startPath, finishPath, finishBody) {
+  const start = await api(startPath, { method: 'POST', body: finishBody?.startBody ?? '{}' });
+  const rawOpts = start.creation_options || start.request_options;
+  const opts = prepOptions(parseCreationOptions(rawOpts), true, finishBody?.displayName);
   const cred = await navigator.credentials.create({ publicKey: opts });
-  await api('/api/v1/auth/passkey/register/finish', {
+  await api(finishPath, {
     method: 'POST',
-    body: JSON.stringify({ flow_ref, email, credential: JSON.stringify(credToJSON(cred)) }),
+    body: JSON.stringify({ flow_ref: start.flow_ref, ...finishBody?.extra, credential: credCreateToJSON(cred) }),
   });
   await refreshSession();
+}
+
+async function runPasskeyGet(startPath, finishPath) {
+  const start = await api(startPath, { method: 'POST', body: '{}' });
+  const opts = prepOptions(parseCreationOptions(start.request_options), false);
+  const cred = await navigator.credentials.get({ publicKey: opts });
+  const payload = credGetToJSON(cred);
+  if (!payload.response.userHandle) {
+    log('Passkey login warning', 'WebAuthn response missing userHandle — pick the passkey you just registered for this site.');
+  }
+  await api(finishPath, {
+    method: 'POST',
+    body: JSON.stringify({ flow_ref: start.flow_ref, credential: payload }),
+  });
+  await refreshSession();
+}
+
+document.getElementById('btn-passkey-register').onclick = async () => {
+  try {
+    if (state.session?.authenticated) {
+      log('Register passkey skipped', 'Already signed in — use Linked methods → Add passkey to attach Touch ID to this account (same user_id as Google).');
+      return;
+    }
+    const email = document.getElementById('email').value.trim();
+    const displayName = email || 'Passkey user';
+    await runPasskeyCreate(
+      '/api/v1/auth/passkey/register/start',
+      '/api/v1/auth/passkey/register/finish',
+      {
+        startBody: JSON.stringify({ email }),
+        extra: { email },
+        displayName,
+      },
+    );
+  } catch (err) {
+    log('Passkey register failed', err.body || err.message || String(err));
+  }
 };
 
 document.getElementById('btn-passkey-login').onclick = async () => {
-  const { flow_ref, request_options } = await api('/api/v1/auth/passkey/login/start', { method: 'POST', body: '{}' });
-  const opts = prepOptions(parseCreationOptions(request_options), false);
-  const cred = await navigator.credentials.get({ publicKey: opts });
-  await api('/api/v1/auth/passkey/login/finish', {
-    method: 'POST',
-    body: JSON.stringify({ flow_ref, credential: JSON.stringify(credToJSON(cred)) }),
-  });
-  await refreshSession();
+  try {
+    await runPasskeyGet('/api/v1/auth/passkey/login/start', '/api/v1/auth/passkey/login/finish');
+  } catch (err) {
+    const body = err.body || {};
+    const msg = body.messages?.[0] || body.flow?.ui?.messages?.[0]?.text || body.error || err.message || String(err);
+    log('Passkey login failed', msg.includes('security key') || msg.includes('does not exist')
+      ? `${msg} — pick the passkey you registered on this ngrok URL, not an older one.`
+      : body);
+  }
 };
 
 document.getElementById('btn-google-login').onclick = () => startOIDC('google', 'login');
@@ -247,53 +299,130 @@ document.getElementById('btn-link-google').onclick = () => startOIDC('google', '
 document.getElementById('btn-link-telegram').onclick = () => startOIDC('telegram', 'link');
 
 document.getElementById('btn-add-passkey').onclick = async () => {
-  const { flow_ref, creation_options } = await api('/api/v1/auth/methods/passkey/start', { method: 'POST', body: '{}' });
-  const opts = prepOptions(parseCreationOptions(creation_options), true);
-  const cred = await navigator.credentials.create({ publicKey: opts });
-  await api('/api/v1/auth/methods/passkey/finish', {
-    method: 'POST',
-    body: JSON.stringify({ flow_ref, credential: JSON.stringify(credToJSON(cred)) }),
-  });
-  await refreshSession();
-  await refreshMethods();
+  try {
+    const s = state.session || await refreshSession();
+    if (!s?.authenticated) {
+      log('Add passkey failed', 'Sign in first (e.g. Google), then Add passkey links Touch ID to that same account.');
+      return;
+    }
+    const displayName = s.email || s.google_email || 'Account';
+    await runPasskeyCreate('/api/v1/auth/methods/passkey/start', '/api/v1/auth/methods/passkey/finish', { displayName });
+    await refreshSession();
+    await refreshMethods();
+    log('Passkey added', `Linked to user ${s.user_id} — Login passkey works without Google; same identity as ${(s.linked_methods || []).join(', ')}.`);
+  } catch (err) {
+    log('Add passkey failed', err.body || err.message || String(err));
+  }
 };
 
 document.getElementById('btn-totp-start').onclick = async () => {
-  const r = await api('/api/v1/auth/2fa/totp/start', { method: 'POST', body: '{}' });
-  state.totpFlowRef = r.flow_ref;
-  document.getElementById('totp-secret').textContent = 'Secret: ' + r.secret;
-  document.getElementById('totp-qr').src = r.qr_data_uri || '';
+  try {
+    const r = await api('/api/v1/auth/2fa/totp/start', { method: 'POST', body: '{}' });
+    state.totpFlowRef = r.flow_ref;
+    document.getElementById('totp-secret').textContent = 'Secret: ' + r.secret;
+    document.getElementById('totp-qr').src = r.qr_data_uri || '';
+    document.getElementById('totp-qr').alt = 'TOTP QR code';
+    log('TOTP enrollment started — scan QR or enter secret in your authenticator app, then Confirm.');
+  } catch (err) {
+    log('TOTP enroll failed', err.body || err.message || String(err));
+  }
 };
 
 document.getElementById('btn-totp-confirm').onclick = async () => {
-  await api('/api/v1/auth/2fa/totp/confirm', {
-    method: 'POST',
-    body: JSON.stringify({ flow_ref: state.totpFlowRef, code: document.getElementById('totp-code').value }),
-  });
-  await refreshSession();
+  try {
+    await api('/api/v1/auth/2fa/totp/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ flow_ref: state.totpFlowRef, code: document.getElementById('totp-code').value }),
+    });
+    await refreshSession();
+    await refreshMethods();
+    log('TOTP enrolled — session is now AAL2 when you use the authenticator code.');
+  } catch (err) {
+    log('TOTP confirm failed', err.body || err.message || String(err));
+  }
 };
 
 document.getElementById('btn-totp-delete').onclick = async () => {
-  await api('/api/v1/auth/2fa/totp', { method: 'DELETE' });
-  await refreshSession();
+  try {
+    await api('/api/v1/auth/2fa/totp', { method: 'DELETE' });
+    await refreshSession();
+    await refreshMethods();
+    document.getElementById('totp-secret').textContent = '';
+    document.getElementById('totp-qr').src = '';
+    log('TOTP removed');
+  } catch (err) {
+    log('TOTP remove failed', err.body || err.message || String(err));
+  }
 };
 
+document.getElementById('btn-stepup-passkey').onclick = async () => {
+  try {
+    const start = await api('/api/v1/auth/stepup/passkey/start', { method: 'POST', body: '{}' });
+    const opts = prepOptions(parseCreationOptions(start.request_options), false);
+    const cred = await navigator.credentials.get({ publicKey: opts });
+    await api('/api/v1/auth/stepup/passkey/finish', {
+      method: 'POST',
+      body: JSON.stringify({ flow_ref: start.flow_ref, credential: credGetToJSON(cred) }),
+    });
+    const s = await refreshSession();
+    log('Passkey step-up complete', { methods_used: s.methods_used, aal: s.aal, hint: start.hint });
+  } catch (err) {
+    log('Passkey step-up failed', err.body || err.message || String(err));
+  }
+};
+
+async function submitStepUpTOTP() {
+  if (!state.stepupFlowRef) {
+    log('TOTP step-up', 'Click “Step up to AAL2 (TOTP)” first.');
+    return;
+  }
+  await api('/api/v1/auth/stepup/aal2/totp', {
+    method: 'POST',
+    body: JSON.stringify({ flow_ref: state.stepupFlowRef, code: document.getElementById('totp-code').value }),
+  });
+  state.stepupFlowRef = null;
+  const s = await refreshSession();
+  log('AAL2 step-up complete', { aal: s.aal, methods_used: s.methods_used });
+}
+
 document.getElementById('btn-stepup-aal2').onclick = async () => {
-  const r = await api('/api/v1/auth/stepup/aal2/start', { method: 'POST', body: '{}' });
-  state.stepupFlowRef = r.flow_ref;
+  try {
+    const r = await api('/api/v1/auth/stepup/aal2/start', { method: 'POST', body: '{}' });
+    state.stepupFlowRef = r.flow_ref;
+    log('AAL2 step-up started', 'Enter the 6-digit code from your authenticator app, then Submit TOTP step-up.');
+  } catch (err) {
+    log('AAL2 step-up start failed', err.body || err.message || String(err));
+  }
+};
+
+document.getElementById('btn-stepup-aal2-submit').onclick = async () => {
+  try {
+    await submitStepUpTOTP();
+  } catch (err) {
+    log('AAL2 step-up failed', err.body || err.message || String(err));
+  }
 };
 
 document.getElementById('btn-stepup-refresh').onclick = async () => {
   await api('/api/v1/auth/stepup/refresh/start', { method: 'POST', body: '{}' });
 };
 
+document.getElementById('btn-policy-demo').onclick = async () => {
+  try {
+    const r = await api('/api/v1/policy/demo-sensitive', { method: 'POST', body: '{}' });
+    log('Demo policy OK', r);
+  } catch (err) {
+    log('Demo policy denied', err.body || err.message || String(err));
+  }
+};
+
 document.getElementById('totp-code').addEventListener('keydown', async (e) => {
   if (e.key === 'Enter' && state.stepupFlowRef) {
-    await api('/api/v1/auth/stepup/aal2/totp', {
-      method: 'POST',
-      body: JSON.stringify({ flow_ref: state.stepupFlowRef, code: document.getElementById('totp-code').value }),
-    });
-    await refreshSession();
+    try {
+      await submitStepUpTOTP();
+    } catch (err) {
+      log('AAL2 step-up failed', err.body || err.message || String(err));
+    }
   }
 });
 

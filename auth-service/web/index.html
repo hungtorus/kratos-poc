@@ -18,6 +18,7 @@
       <section>
         <h2>Register / Login</h2>
         <label>Email <input id="email" type="email" placeholder="you@example.com" /></label>
+        <p class="hint">Optional for passkey (used as account label). Required for email OTP.</p>
         <div class="row">
           <button id="btn-email-register">Register email OTP</button>
           <button id="btn-email-start">Login email OTP</button>
@@ -39,6 +40,7 @@
 
       <section>
         <h2>Linked methods</h2>
+        <p class="hint">One Kratos identity, many login methods. After Google login, use <strong>Add passkey</strong> (not Register passkey) — passkey joins the same account; Touch ID may show your Google email as the label.</p>
         <div class="row">
           <button id="btn-refresh-methods">Refresh</button>
           <button id="btn-link-google">Link Google</button>
@@ -50,6 +52,7 @@
 
       <section>
         <h2>2FA (TOTP)</h2>
+        <p class="hint">Sign in first. Enroll shows a QR code; enter the 6-digit code to confirm. If enroll fails with 403, use Step-up → Re-auth (refresh).</p>
         <div class="row">
           <button id="btn-totp-start">Enroll TOTP</button>
           <input id="totp-code" placeholder="000000" />
@@ -62,9 +65,13 @@
 
       <section>
         <h2>Step-up</h2>
+        <p class="hint">Google + passkey in one session: Login Google → <strong>Step up passkey</strong> → check Session <code>methods_used</code>. Both are 1FA so <code>aal</code> stays <code>aal1</code>; for MFA level use TOTP step-up (<code>aal2</code>).</p>
         <div class="row">
-          <button id="btn-stepup-aal2">Step up to AAL2</button>
+          <button id="btn-stepup-passkey">Step up passkey</button>
+          <button id="btn-stepup-aal2">Step up to AAL2 (TOTP)</button>
+          <button id="btn-stepup-aal2-submit">Submit TOTP step-up</button>
           <button id="btn-stepup-refresh">Re-auth (refresh)</button>
+          <button id="btn-policy-demo">Try demo policy (Google+passkey)</button>
         </div>
       </section>
 

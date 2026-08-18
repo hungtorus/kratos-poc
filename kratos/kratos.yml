@@ -79,9 +79,9 @@ selfservice:
             mapper_url: file:///etc/config/kratos/oidc.google.jsonnet
           - id: telegram
             provider: generic
-            client_id: "${TELEGRAM_OIDC_CLIENT_ID}"
-            client_secret: "${TELEGRAM_OIDC_CLIENT_SECRET}"
-            issuer_url: https://oauth.telegram.org
+            client_id: "${TELEGRAM_BROKER_CLIENT_ID}"
+            client_secret: "${TELEGRAM_BROKER_CLIENT_SECRET}"
+            issuer_url: ${TELEGRAM_BROKER_ISSUER}
             scope:
               - openid
               - profile

@@ -83,6 +83,28 @@ func (s *Signer) Sign(userID string, c Claims) (string, string, time.Time, error
 	return signed, jti, exp, err
 }
 
+// SignOIDC signs a broker token with explicitly supplied issuer and audience.
+// It deliberately does not reuse the application token's issuer/audience
+// defaults, preventing a broker token from being accepted as an app token.
+func (s *Signer) SignOIDC(subject, issuer, audience, nonce string, claims map[string]any) (string, time.Time, error) {
+	now := time.Now()
+	exp := now.Add(s.ttl)
+	for k, v := range map[string]any{
+		"iss":   issuer,
+		"sub":   subject,
+		"aud":   []string{audience},
+		"exp":   exp.Unix(),
+		"iat":   now.Unix(),
+		"jti":   uuid.NewString(),
+		"nonce": nonce,
+	} {
+		claims[k] = v
+	}
+	t := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims(claims))
+	signed, err := t.SignedString(s.privateKey)
+	return signed, exp, err
+}
+
 func (s *Signer) Verify(tokenStr string) (*Claims, error) {
 	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (any, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodRSA); !ok {

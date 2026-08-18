@@ -9,12 +9,15 @@ Docker Compose PoC where **auth-service** (Go) is the only public entrypoint. Or
    ```
    https://<your-host>/auth/kratos/self-service/methods/oidc/callback/google
    ```
-3. **Telegram OIDC** via BotFather → Login Widget: set Allowed URL to
+3. **Telegram OIDC** via BotFather → Bot Settings → Web Login: register this
+   broker callback URL:
    ```
-   https://<your-host>/auth/kratos/self-service/methods/oidc/callback/telegram
+   https://<your-host>/oidc/telegram/callback
    ```
    Use the **Client ID** and **Client Secret** from BotFather (not the bot token) as
-   `TELEGRAM_OIDC_CLIENT_ID` / `TELEGRAM_OIDC_CLIENT_SECRET`.
+   `TELEGRAM_OIDC_CLIENT_ID` / `TELEGRAM_OIDC_CLIENT_SECRET`. Set
+   `TELEGRAM_BROKER_CLIENT_SECRET` to a separate high-entropy secret; Kratos
+   uses it only to authenticate to auth-service's internal broker.
 
 ## Quick start
 
@@ -41,14 +44,27 @@ docker compose logs -f auth-service
 
 | Component | Role |
 |-----------|------|
-| `auth-service:8080` | Public facade API, JWT issuer, session token cookie, static UI |
+| `auth-service:8080` | Public facade API, app JWT issuer, Telegram OIDC broker, session token cookie, static UI |
 | `kratos` | Identity server (internal only) |
 | `dynamodb-local` | Auth-service user id mapping |
 | `postgres` | Kratos database |
 
-Kratos has **no inbound ports** but needs **outbound** access to Google and Telegram for OAuth token exchange.
+Kratos has **no inbound ports**. The Telegram broker performs the only outbound
+Telegram authorization-code exchange and validates Telegram's RS256 ID token.
 
 All Kratos self-service flows use the **native API** (`/self-service/*/api`) with `X-Session-Token` — no browser/CSRF flows. OIDC login/register uses session-token exchange codes; the only browser hop is the OAuth provider redirect (proxied at `/auth/kratos/*`).
+
+### Telegram OIDC broker
+
+Kratos is configured against `http://auth-service:8080/internal/oidc/telegram`,
+not `oauth.telegram.org`. The broker exposes public authorization and callback
+routes, but discovery, token, and JWKS routes are internal Docker endpoints.
+It uses state, nonce, and PKCE for the upstream Telegram flow; persists
+short-lived authorization state and one-time codes in DynamoDB; verifies the
+matching Telegram `RSA`/`RS256` JWK while ignoring unsupported `ES256K`
+entries; then issues a distinct-audience RS256 ID token for Kratos.
+
+No custom Kratos image, TLS interception, DNS override, or JWKS proxy is used.
 
 ## API overview
 
@@ -62,6 +78,10 @@ All Kratos self-service flows use the **native API** (`/self-service/*/api`) wit
 - `POST /api/v1/auth/logout`, `DELETE /api/v1/auth/account`
 - `GET /api/v1/auth/error` — Kratos error redirect target (JSON)
 - `GET /api/v1/auth/oidc/return` — OIDC session-token exchange callback
+- `GET /oidc/telegram/authorize`, `GET /oidc/telegram/callback` — public broker routes
+- `GET /internal/oidc/telegram/.well-known/openid-configuration`,
+  `POST /internal/oidc/telegram/token`, `GET /internal/oidc/telegram/jwks.json`
+  — Kratos-only broker routes
 
 See [docs/poc-plan.md](docs/poc-plan.md) for full design notes.
 

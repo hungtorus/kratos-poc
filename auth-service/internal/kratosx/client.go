@@ -36,8 +36,16 @@ type FlowResponse struct {
 }
 
 type UIModel struct {
-	Action string   `json:"action"`
-	Nodes  []UINode `json:"nodes"`
+	Action   string      `json:"action"`
+	Messages []UIMessage `json:"messages"`
+	Nodes    []UINode    `json:"nodes"`
+}
+
+type UIMessage struct {
+	ID      int64  `json:"id"`
+	Text    string `json:"text"`
+	Type    string `json:"type"`
+	Context any    `json:"context"`
 }
 
 type UINode struct {
@@ -49,6 +57,7 @@ type UINode struct {
 
 type UINodeAttr struct {
 	Name           string         `json:"name"`
+	ID             string         `json:"id"`
 	Type           string         `json:"type"`
 	Value          any            `json:"value"`
 	Disabled       bool           `json:"disabled"`
@@ -291,8 +300,6 @@ func (c *Client) do(ctx context.Context, method, urlStr string, body any, sessio
 	return result, nil
 }
 
-func CSRFToken(_ *FlowResponse) string { return "" }
-
 func NodeValue(flow *FlowResponse, name string) (string, bool) {
 	if flow == nil {
 		return "", false
@@ -311,16 +318,40 @@ func NodeValue(flow *FlowResponse, name string) (string, bool) {
 	return "", false
 }
 
+func FlowMessages(flow *FlowResponse) []string {
+	if flow == nil {
+		return nil
+	}
+	out := make([]string, 0, len(flow.UI.Messages))
+	for _, m := range flow.UI.Messages {
+		if m.Text != "" {
+			out = append(out, m.Text)
+		}
+	}
+	return out
+}
+
 func NodeByName(flow *FlowResponse, name string) *UINode {
 	if flow == nil {
 		return nil
 	}
 	for i := range flow.UI.Nodes {
-		if flow.UI.Nodes[i].Attributes.Name == name {
-			return &flow.UI.Nodes[i]
+		n := &flow.UI.Nodes[i]
+		if n.Attributes.Name == name || n.Attributes.ID == name {
+			return n
 		}
 	}
 	return nil
+}
+
+func TOTPSecret(node *UINode) string {
+	if node == nil || node.Attributes.Text == nil {
+		return ""
+	}
+	if s, ok := node.Attributes.Text.Context["secret"].(string); ok && s != "" {
+		return s
+	}
+	return node.Attributes.Text.Text
 }
 
 func AggregateLinkedMethods(ident *AdminIdentity) []string {
@@ -390,6 +421,23 @@ func MethodsUsed(session *WhoAmI) []string {
 		}
 	}
 	return out
+}
+
+// HasMethods reports whether every required AMR entry appears in used (exact match).
+func HasMethods(used, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	set := make(map[string]struct{}, len(used))
+	for _, m := range used {
+		set[m] = struct{}{}
+	}
+	for _, r := range required {
+		if _, ok := set[r]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func TraitString(traits map[string]any, key string) string {
