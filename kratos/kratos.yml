@@ -1,0 +1,124 @@
+version: v26.2.0
+
+dsn: postgres://kratos:secret@postgres:5432/kratos?sslmode=disable
+
+serve:
+  public:
+    base_url: ${PUBLIC_BASE_URL}/auth/kratos/
+    cors:
+      enabled: false
+  admin:
+    base_url: http://kratos:4434/
+
+cookies:
+  domain: ${PUBLIC_HOST}
+  path: /
+  same_site: Lax
+  secure: "true"
+
+session:
+  cookie:
+    domain: ${PUBLIC_HOST}
+    path: /
+    same_site: Lax
+    secure: "true"
+  whoami:
+    required_aal: aal1
+
+selfservice:
+  default_browser_return_url: ${PUBLIC_BASE_URL}/
+  allowed_return_urls:
+    - ${PUBLIC_BASE_URL}/
+    - ${PUBLIC_BASE_URL}/api/v1/auth/oidc/return
+  flows:
+    error:
+      ui_url: ${PUBLIC_BASE_URL}/api/v1/auth/error
+    registration:
+      style: unified
+      enabled: true
+    login:
+      style: unified
+    settings:
+      required_aal: aal1
+      privileged_session_max_age: 1h
+    logout:
+      after:
+        default_browser_return_url: ${PUBLIC_BASE_URL}/
+  methods:
+    password:
+      enabled: false
+    code:
+      enabled: true
+      passwordless_enabled: true
+      config:
+        lifespan: 15m
+        max_submissions: 5
+    passkey:
+      enabled: true
+      config:
+        rp:
+          id: ${PUBLIC_HOST}
+          display_name: Kratos PoC
+          origins:
+            - ${PUBLIC_BASE_URL}
+    totp:
+      enabled: true
+      config:
+        issuer: Kratos PoC
+    oidc:
+      enabled: true
+      config:
+        providers:
+          - id: google
+            provider: google
+            client_id: ${GOOGLE_CLIENT_ID}
+            client_secret: ${GOOGLE_CLIENT_SECRET}
+            scope:
+              - email
+              - profile
+            mapper_url: file:///etc/config/kratos/oidc.google.jsonnet
+          - id: telegram
+            provider: generic
+            client_id: "${TELEGRAM_OIDC_CLIENT_ID}"
+            client_secret: "${TELEGRAM_OIDC_CLIENT_SECRET}"
+            issuer_url: https://oauth.telegram.org
+            scope:
+              - openid
+              - profile
+            claims_source: id_token
+            pkce: auto
+            mapper_url: file:///etc/config/kratos/oidc.telegram.jsonnet
+
+courier:
+  delivery_strategy: http
+  http:
+    request_config:
+      url: http://auth-service:8080/internal/courier
+      method: POST
+      body: file:///etc/config/kratos/courier.jsonnet
+      headers:
+        Content-Type: application/json
+      auth:
+        type: api_key
+        config:
+          name: Authorization
+          value: Bearer ${COURIER_WEBHOOK_SECRET}
+          in: header
+
+log:
+  level: debug
+  format: text
+
+secrets:
+  default:
+    - dev-secret-please-change-in-production
+  cookie:
+    - dev-cookie-secret-please-change
+  cipher:
+    - abcdefghijklmnopqrstuvwxyz123456
+
+identity:
+  default_schema_id: user
+  schemas:
+    - id: user
+      url: file:///etc/config/kratos/identity.schema.json

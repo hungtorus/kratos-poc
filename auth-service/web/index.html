@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kratos Auth PoC Console</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Kratos Auth PoC</h1>
+    <p>Browser talks only to auth-service. Kratos stays internal.</p>
+    <p id="auth-banner" class="auth-banner auth-banner--unknown">Session: checking…</p>
+  </header>
+
+  <div class="layout">
+    <aside class="panel panel-left">
+      <section>
+        <h2>Register / Login</h2>
+        <label>Email <input id="email" type="email" placeholder="you@example.com" /></label>
+        <div class="row">
+          <button id="btn-email-register">Register email OTP</button>
+          <button id="btn-email-start">Login email OTP</button>
+          <input id="otp" placeholder="123456" />
+          <button id="btn-email-verify">Verify OTP</button>
+        </div>
+        <div class="row">
+          <button id="btn-passkey-register">Register passkey</button>
+          <button id="btn-passkey-login">Login passkey</button>
+        </div>
+        <div class="row">
+          <button id="btn-google-login">Login Google</button>
+          <button id="btn-google-register">Register Google</button>
+          <button id="btn-telegram-login">Login Telegram</button>
+          <button id="btn-telegram-register">Register Telegram</button>
+        </div>
+        <p class="hint">Last OTP (also in docker logs): <code id="last-otp">-</code></p>
+      </section>
+
+      <section>
+        <h2>Linked methods</h2>
+        <div class="row">
+          <button id="btn-refresh-methods">Refresh</button>
+          <button id="btn-link-google">Link Google</button>
+          <button id="btn-link-telegram">Link Telegram</button>
+          <button id="btn-add-passkey">Add passkey</button>
+        </div>
+        <ul id="methods-list"></ul>
+      </section>
+
+      <section>
+        <h2>2FA (TOTP)</h2>
+        <div class="row">
+          <button id="btn-totp-start">Enroll TOTP</button>
+          <input id="totp-code" placeholder="000000" />
+          <button id="btn-totp-confirm">Confirm</button>
+          <button id="btn-totp-delete">Remove TOTP</button>
+        </div>
+        <div id="totp-secret"></div>
+        <img id="totp-qr" alt="" />
+      </section>
+
+      <section>
+        <h2>Step-up</h2>
+        <div class="row">
+          <button id="btn-stepup-aal2">Step up to AAL2</button>
+          <button id="btn-stepup-refresh">Re-auth (refresh)</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>Session / danger</h2>
+        <div class="row">
+          <button id="btn-session">Refresh session</button>
+          <button id="btn-logout">Logout</button>
+          <button id="btn-delete">Delete account</button>
+        </div>
+      </section>
+    </aside>
+
+    <aside class="panel panel-right">
+      <section class="debug-section">
+        <div class="panel-header">
+          <h2>Session</h2>
+          <button type="button" id="btn-clear-log" class="btn-secondary">Clear log</button>
+        </div>
+        <pre id="session-view">Not loaded</pre>
+        <pre id="jwt-view"></pre>
+      </section>
+
+      <section class="debug-section">
+        <details>
+          <summary>Raw whoami</summary>
+          <pre id="whoami-view"></pre>
+        </details>
+        <details>
+          <summary>Raw admin identity</summary>
+          <pre id="identity-view"></pre>
+        </details>
+      </section>
+
+      <section class="debug-section log-section">
+        <div class="panel-header">
+          <h2>Request log</h2>
+        </div>
+        <pre id="req-log"></pre>
+      </section>
+    </aside>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

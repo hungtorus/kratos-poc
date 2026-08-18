@@ -1,0 +1,54 @@
+{
+  "$id": "https://example.com/identity.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "User",
+  "type": "object",
+  "properties": {
+    "traits": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "title": "E-Mail",
+          "minLength": 3,
+          "ory.sh/kratos": {
+            "credentials": {
+              "code": {
+                "identifier": true,
+                "via": "email"
+              },
+              "passkey": {
+                "display_name": true
+              },
+              "totp": {
+                "account_name": true
+              }
+            },
+            "verification": {
+              "via": "email"
+            },
+            "recovery": {
+              "via": "email"
+            }
+          }
+        },
+        "google_email": {
+          "type": "string",
+          "format": "email",
+          "title": "Google E-Mail"
+        },
+        "telegram_id": {
+          "type": "string",
+          "title": "Telegram ID"
+        },
+        "telegram_username": {
+          "type": "string",
+          "title": "Telegram Username"
+        }
+      },
+      "required": ["email"],
+      "additionalProperties": false
+    }
+  }
+}

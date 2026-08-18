@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: kratos
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: kratos
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kratos -d kratos"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kratos-migrate:
+    image: oryd/kratos:v26.2.0
+    environment:
+      DSN: postgres://kratos:secret@postgres:5432/kratos?sslmode=disable
+    volumes:
+      - ./kratos:/etc/config/kratos:ro
+    command: migrate sql -e --yes
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  kratos:
+    image: oryd/kratos:v26.2.0
+    environment:
+      DSN: postgres://kratos:secret@postgres:5432/kratos?sslmode=disable
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      TELEGRAM_OIDC_CLIENT_ID: ${TELEGRAM_OIDC_CLIENT_ID}
+      TELEGRAM_OIDC_CLIENT_SECRET: ${TELEGRAM_OIDC_CLIENT_SECRET}
+      COURIER_WEBHOOK_SECRET: ${COURIER_WEBHOOK_SECRET}
+    volumes:
+      - ./kratos:/etc/config/kratos:ro
+    entrypoint: ["/bin/sh", "/etc/config/kratos/docker-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:4433/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    depends_on:
+      kratos-migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:latest
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "8080:8080"
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      KRATOS_PUBLIC_URL: http://kratos:4433
+      KRATOS_ADMIN_URL: http://kratos:4434
+      COURIER_WEBHOOK_SECRET: ${COURIER_WEBHOOK_SECRET}
+      JWT_ISSUER: ${JWT_ISSUER:-${PUBLIC_BASE_URL}}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-kratos-poc-web}
+      JWT_TTL: ${JWT_TTL:-1h}
+      JWT_PRIVATE_KEY_PATH: /etc/auth/keys/jwt.pem
+      PROFILE_IDENTIFIER_SALT: ${PROFILE_IDENTIFIER_SALT:-dev-salt}
+      DYNAMODB_ENDPOINT: http://dynamodb-local:8000
+      DYNAMODB_REGION: ${DYNAMODB_REGION:-us-east-1}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./keys:/etc/auth/keys:ro
+    depends_on:
+      kratos:
+        condition: service_healthy
+      dynamodb-local:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
