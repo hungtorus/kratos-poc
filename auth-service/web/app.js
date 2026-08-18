@@ -1,4 +1,4 @@
-const state = { flowRef: null, totpFlowRef: null, stepupFlowRef: null, session: null };
+const state = { flowRef: null, linkEmailFlowRef: null, totpFlowRef: null, stepupFlowRef: null, stepupEmailFlowRef: null, session: null };
 const SESSION_KEY = 'poc_kratos_session';
 
 function getSessionToken() {
@@ -24,7 +24,8 @@ function updateAuthBanner(session) {
   if (!el) return;
   if (session?.authenticated) {
     el.className = 'auth-banner auth-banner--ok';
-    el.textContent = `Signed in as ${session.email || session.user_id} (AAL ${session.aal})`;
+    const who = session.email || session.username || session.user_id;
+    el.textContent = `Signed in as ${who} (AAL ${session.aal})`;
   } else {
     el.className = 'auth-banner auth-banner--fail';
     el.textContent = 'Not signed in — use the ngrok HTTPS URL (not localhost) for Google/Telegram';
@@ -92,13 +93,80 @@ async function refreshSession() {
   return s;
 }
 
+function otpCodeFromPayload(o) {
+  if (!o || !Object.keys(o).length) return '';
+  return o.code || o.login_code || o.verification_code || o.registration_code || o.recovery_code || '';
+}
+
+async function fetchLastOTP({ email, latest = false } = {}) {
+  const params = new URLSearchParams();
+  if (email) params.set('email', email);
+  if (latest) params.set('latest', '1');
+  const res = await fetch(`/api/v1/debug/last-otp?${params}`, { credentials: 'include' });
+  return res.json();
+}
+
+function showOTPIn(elId, o, inputId) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  const code = otpCodeFromPayload(o);
+  const type = o?.code_type ? ` (${o.code_type})` : '';
+  const who = o?.recipient ? ` → ${o.recipient}` : '';
+  el.textContent = code ? `${code}${type}${who}` : '-';
+  if (code && inputId) {
+    const input = document.getElementById(inputId);
+    if (input && !input.value) input.placeholder = code;
+  }
+}
+
 async function refreshOTP() {
-  const email = document.getElementById('email').value;
-  if (!email) return;
+  const email = document.getElementById('email')?.value?.trim();
   try {
-    const o = await api(`/api/v1/debug/last-otp?email=${encodeURIComponent(email)}`);
-    document.getElementById('last-otp').textContent = o.login_code || o.registration_code || JSON.stringify(o);
+    const o = email
+      ? await fetchLastOTP({ email })
+      : await fetchLastOTP({ latest: true });
+    showOTPIn('last-otp', o);
   } catch {}
+}
+
+async function refreshLinkOTP(emailOverride) {
+  const email = emailOverride || document.getElementById('link-email')?.value?.trim();
+  try {
+    const o = email
+      ? await fetchLastOTP({ email })
+      : await fetchLastOTP({ latest: true });
+    showOTPIn('link-last-otp', o, 'link-otp');
+  } catch {}
+}
+
+async function refreshStepUpOTP(emailOverride) {
+  const email = emailOverride || stepUpEmail();
+  try {
+    const o = email
+      ? await fetchLastOTP({ email })
+      : await fetchLastOTP({ latest: true });
+    showOTPIn('stepup-last-otp', o, 'stepup-otp');
+    const code = otpCodeFromPayload(o);
+    if (code) showOTPIn('last-otp', o);
+  } catch {}
+}
+
+function pollLinkOTP(email, times = 10) {
+  let n = 0;
+  const tick = () => {
+    refreshLinkOTP(email);
+    if (++n < times) setTimeout(tick, 1200);
+  };
+  setTimeout(tick, 400);
+}
+
+function pollStepUpOTP(email, times = 10) {
+  let n = 0;
+  const tick = () => {
+    refreshStepUpOTP(email);
+    if (++n < times) setTimeout(tick, 1200);
+  };
+  setTimeout(tick, 400);
 }
 
 async function refreshMethods() {
@@ -263,17 +331,18 @@ document.getElementById('btn-passkey-register').onclick = async () => {
       log('Register passkey skipped', 'Already signed in — use Linked methods → Add passkey to attach Touch ID to this account (same user_id as Google).');
       return;
     }
-    const email = document.getElementById('email').value.trim();
-    const displayName = email || 'Passkey user';
+    const username = document.getElementById('username').value.trim();
+    const displayName = username || 'Passkey user';
     await runPasskeyCreate(
       '/api/v1/auth/passkey/register/start',
       '/api/v1/auth/passkey/register/finish',
       {
-        startBody: JSON.stringify({ email }),
-        extra: { email },
+        startBody: JSON.stringify({ username }),
+        extra: { username },
         displayName,
       },
     );
+    await refreshMethods();
   } catch (err) {
     log('Passkey register failed', err.body || err.message || String(err));
   }
@@ -305,13 +374,62 @@ document.getElementById('btn-add-passkey').onclick = async () => {
       log('Add passkey failed', 'Sign in first (e.g. Google), then Add passkey links Touch ID to that same account.');
       return;
     }
-    const displayName = s.email || s.google_email || 'Account';
+    const displayName = s.username || s.email || s.google_email || 'Account';
     await runPasskeyCreate('/api/v1/auth/methods/passkey/start', '/api/v1/auth/methods/passkey/finish', { displayName });
     await refreshSession();
     await refreshMethods();
-    log('Passkey added', `Linked to user ${s.user_id} — Login passkey works without Google; same identity as ${(s.linked_methods || []).join(', ')}.`);
+    log('Passkey added', `Linked to user ${s.user_id} — same identity as ${(s.linked_methods || []).join(', ')}.`);
   } catch (err) {
     log('Add passkey failed', err.body || err.message || String(err));
+  }
+};
+
+document.getElementById('btn-link-email-otp').onclick = async () => {
+  try {
+    const s = state.session || await refreshSession();
+    if (!s?.authenticated) {
+      log('Link email OTP failed', 'Sign in first, then link email OTP.');
+      return;
+    }
+    const email = document.getElementById('link-email').value.trim();
+    if (!email) {
+      log('Link email OTP failed', 'Enter your email in the “Email to link” field in Linked methods.');
+      return;
+    }
+    const r = await api('/api/v1/auth/methods/email-otp/start', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    });
+    state.linkEmailFlowRef = r.flow_ref;
+    log('Email OTP link started — enter the code below (verification_code)', r);
+    pollLinkOTP(r.email || email);
+  } catch (err) {
+    log('Link email OTP failed', err.body || err.message || String(err));
+  }
+};
+
+document.getElementById('btn-link-email-verify').onclick = async () => {
+  try {
+    const code = document.getElementById('link-otp').value.trim();
+    if (!state.linkEmailFlowRef) {
+      log('Verify link OTP failed', 'Click Link email OTP first.');
+      return;
+    }
+    if (!code) {
+      log('Verify link OTP failed', 'Enter the OTP code in the field above Verify link OTP.');
+      return;
+    }
+    await api('/api/v1/auth/methods/email-otp/verify', {
+      method: 'POST',
+      body: JSON.stringify({ flow_ref: state.linkEmailFlowRef, code }),
+    });
+    state.linkEmailFlowRef = null;
+    document.getElementById('link-otp').value = '';
+    await refreshSession();
+    await refreshMethods();
+    log('Email OTP linked');
+  } catch (err) {
+    log('Verify link OTP failed', err.body || err.message || String(err));
   }
 };
 
@@ -368,6 +486,80 @@ document.getElementById('btn-stepup-passkey').onclick = async () => {
     log('Passkey step-up complete', { methods_used: s.methods_used, aal: s.aal, hint: start.hint });
   } catch (err) {
     log('Passkey step-up failed', err.body || err.message || String(err));
+  }
+};
+
+document.getElementById('btn-stepup-google').onclick = async () => {
+  try {
+    const s = state.session || await refreshSession();
+    if (!s?.authenticated) {
+      log('Google step-up failed', 'Sign in first.');
+      return;
+    }
+    const { redirect_url, debug, hint } = await api('/api/v1/auth/stepup/google/start', { method: 'POST', body: '{}' });
+    if (!redirect_url) {
+      log('Google step-up failed', debug || 'no redirect_url');
+      return;
+    }
+    log('Google step-up redirect', { hint, debug });
+    redirectOIDC(redirect_url, debug);
+  } catch (err) {
+    log('Google step-up failed', err.body || err.message || String(err));
+  }
+};
+
+function stepUpEmail() {
+  return document.getElementById('link-email')?.value?.trim()
+    || document.getElementById('email')?.value?.trim()
+    || state.session?.email
+    || '';
+}
+
+document.getElementById('btn-stepup-email-otp').onclick = async () => {
+  try {
+    const s = state.session || await refreshSession();
+    if (!s?.authenticated) {
+      log('Email OTP step-up failed', 'Sign in first.');
+      return;
+    }
+    const email = stepUpEmail();
+    const body = email ? JSON.stringify({ email }) : '{}';
+    const start = await api('/api/v1/auth/stepup/email-otp/start', { method: 'POST', body });
+    state.stepupEmailFlowRef = start.flow_ref;
+    if (start.email) {
+      document.getElementById('link-email').value = start.email;
+      document.getElementById('email').value = start.email;
+    }
+    log('Email OTP step-up started — OTP is login_code (not verification_code)', start);
+    pollStepUpOTP(start.email);
+  } catch (err) {
+    log('Email OTP step-up failed', err.body || err.message || String(err));
+  }
+};
+
+document.getElementById('btn-stepup-email-verify').onclick = async () => {
+  try {
+    const code = document.getElementById('stepup-otp').value.trim()
+      || document.getElementById('link-otp').value.trim()
+      || document.getElementById('otp').value.trim();
+    if (!state.stepupEmailFlowRef) {
+      log('Email OTP step-up verify failed', 'Click Step up email OTP first.');
+      return;
+    }
+    if (!code) {
+      log('Email OTP step-up verify failed', 'Enter the OTP code.');
+      return;
+    }
+    await api('/api/v1/auth/stepup/email-otp/verify', {
+      method: 'POST',
+      body: JSON.stringify({ flow_ref: state.stepupEmailFlowRef, code }),
+    });
+    state.stepupEmailFlowRef = null;
+    document.getElementById('stepup-otp').value = '';
+    const s = await refreshSession();
+    log('Email OTP step-up complete', { methods_used: s.methods_used, aal: s.aal });
+  } catch (err) {
+    log('Email OTP step-up verify failed', err.body || err.message || String(err));
   }
 };
 
@@ -452,6 +644,18 @@ if (qs.get('oidc') === 'ok') {
     .then((s) => {
       if (s.authenticated) log('Google/Telegram sign-in complete', { user_id: s.user_id, email: s.email });
       else log('OIDC finished but session still unauthenticated — check token in Application → Session Storage');
+      history.replaceState({}, '', '/');
+    });
+}
+if (qs.get('oidc') === 'stepup') {
+  log('Google step-up return succeeded — refreshing session…');
+  refreshSession()
+    .then((s) => {
+      if (s.authenticated) {
+        log('Google step-up complete', { methods_used: s.methods_used, aal: s.aal, user_id: s.user_id });
+      } else {
+        log('Google step-up finished but session unauthenticated');
+      }
       history.replaceState({}, '', '/');
     });
 }

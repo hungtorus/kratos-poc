@@ -30,6 +30,7 @@ selfservice:
   allowed_return_urls:
     - ${PUBLIC_BASE_URL}/
     - ${PUBLIC_BASE_URL}/api/v1/auth/oidc/return
+    - ${PUBLIC_BASE_URL}/api/v1/auth/oidc/stepup/done
   flows:
     error:
       ui_url: ${PUBLIC_BASE_URL}/api/v1/auth/error
@@ -38,9 +39,19 @@ selfservice:
       enabled: true
     login:
       style: unified
+    verification:
+      enabled: true
+      use: code
+      ui_url: ${PUBLIC_BASE_URL}/
+      after:
+        default_browser_return_url: ${PUBLIC_BASE_URL}/?email_verified=1
     settings:
       required_aal: aal1
       privileged_session_max_age: 1h
+      after:
+        profile:
+          hooks:
+            - hook: show_verification_ui
     logout:
       after:
         default_browser_return_url: ${PUBLIC_BASE_URL}/

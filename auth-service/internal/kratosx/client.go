@@ -24,6 +24,7 @@ const (
 	FlowLogin        FlowKind = "login"
 	FlowRegistration FlowKind = "registration"
 	FlowSettings     FlowKind = "settings"
+	FlowVerification FlowKind = "verification"
 )
 
 type FlowResponse struct {
@@ -81,6 +82,7 @@ type SubmitResult struct {
 	RedirectBrowserTo string
 	ErrorID           string
 	RawBody           json.RawMessage
+	SetCookies        []*http.Cookie
 }
 
 type WhoAmI struct {
@@ -129,10 +131,20 @@ func New(publicURL, adminURL string) *Client {
 }
 
 func (c *Client) StartFlow(ctx context.Context, kind FlowKind, sessionToken string, query url.Values) (*SubmitResult, error) {
+	return c.startFlow(ctx, kind, "api", sessionToken, query)
+}
+
+// StartBrowserFlow initializes a browser self-service flow (used for OIDC step-up refresh
+// when an API session already exists — Kratos omits session_token_exchange_code in that case).
+func (c *Client) StartBrowserFlow(ctx context.Context, kind FlowKind, sessionToken string, query url.Values) (*SubmitResult, error) {
+	return c.startFlow(ctx, kind, "browser", sessionToken, query)
+}
+
+func (c *Client) startFlow(ctx context.Context, kind FlowKind, style, sessionToken string, query url.Values) (*SubmitResult, error) {
 	if query == nil {
 		query = url.Values{}
 	}
-	path := fmt.Sprintf("%s/self-service/%s/api?%s", c.publicURL, kind, query.Encode())
+	path := fmt.Sprintf("%s/self-service/%s/%s?%s", c.publicURL, kind, style, query.Encode())
 	return c.do(ctx, http.MethodGet, path, nil, sessionToken)
 }
 
@@ -267,7 +279,11 @@ func (c *Client) do(ctx context.Context, method, urlStr string, body any, sessio
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	result := &SubmitResult{Status: resp.StatusCode, RawBody: raw}
+	result := &SubmitResult{
+		Status:     resp.StatusCode,
+		RawBody:    raw,
+		SetCookies: resp.Cookies(),
+	}
 
 	var envelope struct {
 		RedirectBrowserTo          string          `json:"redirect_browser_to"`
@@ -279,11 +295,14 @@ func (c *Client) do(ctx context.Context, method, urlStr string, body any, sessio
 		} `json:"error"`
 	}
 	_ = json.Unmarshal(raw, &envelope)
-	result.RedirectBrowserTo = envelope.RedirectBrowserTo
 	result.Session = envelope.Session
 	result.SessionToken = envelope.SessionToken
+	result.RedirectBrowserTo = envelope.RedirectBrowserTo
 	if envelope.Error != nil {
 		result.ErrorID = envelope.Error.ID
+	}
+	if result.RedirectBrowserTo == "" {
+		result.RedirectBrowserTo = ExtractRedirectBrowserTo(result)
 	}
 
 	var flow FlowResponse
@@ -424,6 +443,68 @@ func MethodsUsed(session *WhoAmI) []string {
 }
 
 // HasMethods reports whether every required AMR entry appears in used (exact match).
+func HasAuthMethod(session *WhoAmI, method, provider string) bool {
+	if session == nil {
+		return false
+	}
+	for _, m := range session.AuthenticationMethods {
+		if m.Method != method {
+			continue
+		}
+		if provider == "" || m.Provider == provider {
+			return true
+		}
+	}
+	return false
+}
+
+type AdminSession struct {
+	ID                    string                 `json:"id"`
+	Active                bool                   `json:"active"`
+	AuthenticatedAt       time.Time              `json:"authenticated_at"`
+	AuthenticationMethods []AuthenticationMethod `json:"authentication_methods"`
+}
+
+func (c *Client) ListIdentitySessions(ctx context.Context, identityID string) ([]AdminSession, error) {
+	u := fmt.Sprintf("%s/admin/identities/%s/sessions?per_page=250", c.adminURL, url.PathEscape(identityID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list identity sessions: %d %s", resp.StatusCode, string(raw))
+	}
+	var out []AdminSession
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Client) RevokeSession(ctx context.Context, sessionID string) error {
+	u := fmt.Sprintf("%s/admin/sessions/%s", c.adminURL, url.PathEscape(sessionID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("revoke session: %d %s", resp.StatusCode, string(raw))
+	}
+	return nil
+}
+
 func HasMethods(used, required []string) bool {
 	if len(required) == 0 {
 		return true
@@ -456,6 +537,103 @@ func TraitString(traits map[string]any, key string) string {
 	}
 }
 
+// PrimaryContact returns the best display/login contact trait for app user records.
+func PrimaryContact(traits map[string]any) string {
+	if email := TraitString(traits, "email"); email != "" {
+		return email
+	}
+	return TraitString(traits, "username")
+}
+
+func HasLinkedMethod(ident *AdminIdentity, method string) bool {
+	for _, m := range AggregateLinkedMethods(ident) {
+		if m == method {
+			return true
+		}
+	}
+	return false
+}
+
+// LinkedEmailAddress returns the email used for code/OTP login on this identity.
+func LinkedEmailAddress(traits map[string]any, admin *AdminIdentity) string {
+	if email := TraitString(traits, "email"); email != "" {
+		return email
+	}
+	if admin == nil {
+		return ""
+	}
+	cred, ok := admin.Credentials["code"]
+	if !ok || len(cred.Config) == 0 {
+		return ""
+	}
+	var cfg struct {
+		Addresses []struct {
+			Address string `json:"address"`
+		} `json:"addresses"`
+	}
+	if json.Unmarshal(cred.Config, &cfg) != nil || len(cfg.Addresses) == 0 {
+		return ""
+	}
+	return cfg.Addresses[0].Address
+}
+
+// UsernameFromEmail derives a schema username from an email local-part.
+func UsernameFromEmail(email string) string {
+	local := strings.Split(strings.TrimSpace(email), "@")[0]
+	if local == "" {
+		return ""
+	}
+	return local
+}
+
+// FlowAwaitingCode reports whether the flow UI exposes a code input node.
+func FlowAwaitingCode(flow *FlowResponse) bool {
+	if flow == nil {
+		return false
+	}
+	if NodeByName(flow, "code") != nil {
+		return true
+	}
+	for _, n := range flow.UI.Nodes {
+		if n.Group == "code" && n.Attributes.Name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// ContinueWithVerification extracts a verification flow spawned after settings profile update.
+func ContinueWithVerification(sub *SubmitResult) (flowID, address string, ok bool) {
+	if sub == nil || len(sub.RawBody) == 0 {
+		return "", "", false
+	}
+	var envelope struct {
+		ContinueWith []continueWithItem `json:"continue_with"`
+		Details      struct {
+			ContinueWith []continueWithItem `json:"continue_with"`
+		} `json:"details"`
+	}
+	if json.Unmarshal(sub.RawBody, &envelope) != nil {
+		return "", "", false
+	}
+	for _, list := range [][]continueWithItem{envelope.ContinueWith, envelope.Details.ContinueWith} {
+		for _, item := range list {
+			if item.Action == "show_verification_ui" && item.Flow.ID != "" {
+				return item.Flow.ID, item.Flow.VerifiableAddress, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+type continueWithItem struct {
+	Action string `json:"action"`
+	Flow   struct {
+		ID                string `json:"id"`
+		VerifiableAddress string `json:"verifiable_address"`
+	} `json:"flow"`
+}
+
 func ExtractSessionToken(res *SubmitResult) string {
 	if res == nil {
 		return ""
@@ -468,6 +646,30 @@ func ExtractSessionToken(res *SubmitResult) string {
 	}
 	if json.Unmarshal(res.RawBody, &top) == nil && top.SessionToken != "" {
 		return top.SessionToken
+	}
+	return ""
+}
+
+func ExtractRedirectBrowserTo(res *SubmitResult) string {
+	if res == nil {
+		return ""
+	}
+	if res.RedirectBrowserTo != "" {
+		return res.RedirectBrowserTo
+	}
+	var top struct {
+		RedirectBrowserTo string `json:"redirect_browser_to"`
+		Error             struct {
+			RedirectBrowserTo string `json:"redirect_browser_to"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(res.RawBody, &top) == nil {
+		if top.Error.RedirectBrowserTo != "" {
+			return top.Error.RedirectBrowserTo
+		}
+		if top.RedirectBrowserTo != "" {
+			return top.RedirectBrowserTo
+		}
 	}
 	return ""
 }

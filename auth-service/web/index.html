@@ -17,8 +17,9 @@
     <aside class="panel panel-left">
       <section>
         <h2>Register / Login</h2>
+        <label>Username <input id="username" type="text" placeholder="optional for passkey" /></label>
         <label>Email <input id="email" type="email" placeholder="you@example.com" /></label>
-        <p class="hint">Optional for passkey (used as account label). Required for email OTP.</p>
+        <p class="hint">Passkey uses username only (auto-generated if empty). Email OTP requires a real email.</p>
         <div class="row">
           <button id="btn-email-register">Register email OTP</button>
           <button id="btn-email-start">Login email OTP</button>
@@ -40,13 +41,20 @@
 
       <section>
         <h2>Linked methods</h2>
-        <p class="hint">One Kratos identity, many login methods. After Google login, use <strong>Add passkey</strong> (not Register passkey) — passkey joins the same account; Touch ID may show your Google email as the label.</p>
+        <p class="hint">One Kratos identity, many login methods. Passkey-first accounts have no email until you link it below.</p>
+        <label>Email to link <input id="link-email" type="email" placeholder="you@example.com" /></label>
         <div class="row">
           <button id="btn-refresh-methods">Refresh</button>
           <button id="btn-link-google">Link Google</button>
           <button id="btn-link-telegram">Link Telegram</button>
+          <button id="btn-link-email-otp">Link email OTP</button>
           <button id="btn-add-passkey">Add passkey</button>
         </div>
+        <div class="row">
+          <input id="link-otp" placeholder="123456" />
+          <button id="btn-link-email-verify">Verify link OTP</button>
+        </div>
+        <p class="hint">After <strong>Link email OTP</strong>, OTP appears here and in docker logs (<code>otp_code=</code>): <code id="link-last-otp">-</code></p>
         <ul id="methods-list"></ul>
       </section>
 
@@ -65,14 +73,19 @@
 
       <section>
         <h2>Step-up</h2>
-        <p class="hint">Google + passkey in one session: Login Google → <strong>Step up passkey</strong> → check Session <code>methods_used</code>. Both are 1FA so <code>aal</code> stays <code>aal1</code>; for MFA level use TOTP step-up (<code>aal2</code>).</p>
+        <p class="hint">Multi-factor in one session: Login Google → <strong>Step up passkey</strong>, or passkey login → <strong>Step up Google</strong> → check <code>methods_used</code>. Both are 1FA so <code>aal</code> stays <code>aal1</code>; use TOTP step-up for <code>aal2</code>. Google must be linked first for step-up.</p>
         <div class="row">
           <button id="btn-stepup-passkey">Step up passkey</button>
+          <button id="btn-stepup-google">Step up Google</button>
+          <button id="btn-stepup-email-otp">Step up email OTP</button>
+          <input id="stepup-otp" placeholder="OTP for step-up" />
+          <button id="btn-stepup-email-verify">Submit email OTP step-up</button>
           <button id="btn-stepup-aal2">Step up to AAL2 (TOTP)</button>
           <button id="btn-stepup-aal2-submit">Submit TOTP step-up</button>
           <button id="btn-stepup-refresh">Re-auth (refresh)</button>
           <button id="btn-policy-demo">Try demo policy (Google+passkey)</button>
         </div>
+        <p class="hint">Step-up OTP (login_code): <code id="stepup-last-otp">-</code></p>
       </section>
 
       <section>

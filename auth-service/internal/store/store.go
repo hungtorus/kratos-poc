@@ -46,14 +46,18 @@ type FlowRecord struct {
 	KratosFlowID string `dynamodbav:"kratos_flow_id"`
 	Kind         string `dynamodbav:"kind"`
 	Email        string `dynamodbav:"email"`
+	Username     string `dynamodbav:"username"`
 	TTL          int64  `dynamodbav:"ttl"`
 }
 
 type OIDCContext struct {
-	CtxID    string `dynamodbav:"ctx_id"`
-	InitCode string `dynamodbav:"init_code"`
-	Intent   string `dynamodbav:"intent"`
-	TTL      int64  `dynamodbav:"ttl"`
+	CtxID              string `dynamodbav:"ctx_id"`
+	InitCode           string `dynamodbav:"init_code"`
+	Intent             string `dynamodbav:"intent"`
+	PriorSessionToken  string `dynamodbav:"prior_session_token,omitempty"`
+	PriorSessionID     string `dynamodbav:"prior_session_id,omitempty"`
+	StepUpProvider     string `dynamodbav:"stepup_provider,omitempty"`
+	TTL                int64  `dynamodbav:"ttl"`
 }
 
 // OIDCStateRecord maps a short OAuth state (for Telegram's 256-char limit) to Kratos' full state.
@@ -298,6 +302,14 @@ func (s *Store) GetOIDCContext(ctx context.Context, ctxID string) (*OIDCContext,
 		return nil, err
 	}
 	return &rec, nil
+}
+
+func (s *Store) DeleteOIDCContext(ctx context.Context, ctxID string) error {
+	_, err := s.client.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(TableOIDCCtx),
+		Key:       map[string]types.AttributeValue{"ctx_id": &types.AttributeValueMemberS{Value: ctxID}},
+	})
+	return err
 }
 
 func (s *Store) SaveOIDCState(ctx context.Context, rec OIDCStateRecord) error {

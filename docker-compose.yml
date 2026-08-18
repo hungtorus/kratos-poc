@@ -70,6 +70,7 @@ services:
       PUBLIC_HOST: ${PUBLIC_HOST}
       KRATOS_PUBLIC_URL: http://kratos:4433
       KRATOS_ADMIN_URL: http://kratos:4434
+      KRATOS_DSN: postgres://kratos:secret@postgres:5432/kratos?sslmode=disable
       COURIER_WEBHOOK_SECRET: ${COURIER_WEBHOOK_SECRET}
       JWT_ISSUER: ${JWT_ISSUER:-${PUBLIC_BASE_URL}}
       JWT_AUDIENCE: ${JWT_AUDIENCE:-kratos-poc-web}
@@ -92,6 +93,8 @@ services:
       kratos:
         condition: service_healthy
       dynamodb-local:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
 
 volumes:

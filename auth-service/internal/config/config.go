@@ -13,6 +13,8 @@ type Config struct {
 
 	KratosPublicURL string `env:"KRATOS_PUBLIC_URL" env-default:"http://kratos:4433"`
 	KratosAdminURL  string `env:"KRATOS_ADMIN_URL" env-default:"http://kratos:4434"`
+	// KratosDSN enables session AMR merge after OIDC step-up (PoC; same DB as Kratos).
+	KratosDSN string `env:"KRATOS_DSN" env-default:"postgres://kratos:secret@postgres:5432/kratos?sslmode=disable"`
 
 	CourierWebhookSecret string `env:"COURIER_WEBHOOK_SECRET" env-default:"dev-courier-secret"`
 

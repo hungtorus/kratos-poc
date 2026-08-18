@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -18,6 +19,7 @@ import (
 	"github.com/hardy/kratos-poc2/auth-service/internal/config"
 	"github.com/hardy/kratos-poc2/auth-service/internal/httpapi/cookies"
 	"github.com/hardy/kratos-poc2/auth-service/internal/kratosx"
+	"github.com/hardy/kratos-poc2/auth-service/internal/sessionmerge"
 	"github.com/hardy/kratos-poc2/auth-service/internal/store"
 	"github.com/hardy/kratos-poc2/auth-service/internal/telegramoidc"
 	"github.com/hardy/kratos-poc2/auth-service/internal/token"
@@ -136,6 +138,7 @@ func (s *Server) Listen() error {
 	app.Get("/api/v1/debug/auth-state", s.handleDebugAuthState)
 	app.Get("/api/v1/auth/error", s.handleAuthError)
 	app.Get("/api/v1/auth/oidc/return", s.handleOIDCReturn)
+	app.Get("/api/v1/auth/oidc/stepup/done", s.handleOIDCStepUpDone)
 	app.Post("/api/v1/policy/demo-sensitive", s.handlePolicyDemoSensitive)
 
 	auth := app.Group("/api/v1/auth")
@@ -150,6 +153,8 @@ func (s *Server) Listen() error {
 	auth.Post("/methods/passkey/start", s.handlePasskeyLinkStart)
 	auth.Post("/methods/passkey/finish", s.handlePasskeyLinkFinish)
 	auth.Delete("/methods/passkey/:id", s.handlePasskeyRemove)
+	auth.Post("/methods/email-otp/start", s.handleEmailOTPLinkStart)
+	auth.Post("/methods/email-otp/verify", s.handleEmailOTPLinkVerify)
 	auth.Delete("/methods/oidc/:provider", s.handleOIDCUnlink)
 	auth.Post("/2fa/totp/start", s.handleTOTPStart)
 	auth.Post("/2fa/totp/confirm", s.handleTOTPConfirm)
@@ -158,6 +163,9 @@ func (s *Server) Listen() error {
 	auth.Post("/stepup/aal2/totp", s.handleStepUpAAL2TOTP)
 	auth.Post("/stepup/passkey/start", s.handleStepUpPasskeyStart)
 	auth.Post("/stepup/passkey/finish", s.handlePasskeyLoginFinish)
+	auth.Post("/stepup/email-otp/start", s.handleStepUpEmailOTPStart)
+	auth.Post("/stepup/email-otp/verify", s.handleStepUpEmailOTPVerify)
+	auth.Post("/stepup/google/start", s.handleStepUpGoogleStart)
 	auth.Post("/stepup/refresh/start", s.handleStepUpRefreshStart)
 	auth.Post("/logout", s.handleLogout)
 	auth.Delete("/account", s.handleDeleteAccount)
@@ -216,19 +224,48 @@ func (s *Server) handleCourier(c *fiber.Ctx) error {
 	s.log.WithField("courier", payload).Info("courier message")
 	if recipient, ok := payload["recipient"].(string); ok {
 		s.lastOTP.Store(recipient, payload)
+		latest := map[string]any{"recipient": recipient}
+		for k, v := range payload {
+			latest[k] = v
+		}
+		s.lastOTP.Store("_latest", latest)
+		if code := otpFromPayload(payload); code != "" {
+			s.log.WithFields(logrus.Fields{
+				"flow":      "courier_otp",
+				"recipient": recipient,
+				"otp_code":  code,
+				"type":      otpCodeType(payload),
+			}).Info("OTP code (use for verify)")
+		}
 	}
 	return c.SendStatus(fiber.StatusOK)
 }
 
 func (s *Server) handleLastOTP(c *fiber.Ctx) error {
-	email := c.Query("email")
-	if email == "" {
+	email := strings.TrimSpace(c.Query("email"))
+	useLatest := c.Query("latest") == "1" || c.Query("latest") == "true"
+
+	var payload map[string]any
+	if email != "" {
+		if v, ok := s.lastOTP.Load(email); ok {
+			payload, _ = v.(map[string]any)
+		}
+	}
+	if payload == nil && (useLatest || email == "") {
+		if v, ok := s.lastOTP.Load("_latest"); ok {
+			payload, _ = v.(map[string]any)
+		}
+	}
+	if payload == nil {
 		return c.JSON(fiber.Map{})
 	}
-	if v, ok := s.lastOTP.Load(email); ok {
-		return c.JSON(v)
+	out := fiber.Map{}
+	for k, val := range payload {
+		out[k] = val
 	}
-	return c.JSON(fiber.Map{})
+	out["code"] = otpFromPayload(payload)
+	out["code_type"] = otpCodeType(payload)
+	return c.JSON(out)
 }
 
 func (s *Server) handleAuthError(c *fiber.Ctx) error {
@@ -242,13 +279,14 @@ func (s *Server) handleAuthError(c *fiber.Ctx) error {
 	return c.Redirect("/?oidc_error=kratos_" + id)
 }
 
-func (s *Server) saveFlowRef(ctx context.Context, kind kratosx.FlowKind, flow *kratosx.FlowResponse, email string) (string, error) {
+func (s *Server) saveFlowRef(ctx context.Context, kind kratosx.FlowKind, flow *kratosx.FlowResponse, email, username string) (string, error) {
 	ref := uuid.NewString()
 	rec := store.FlowRecord{
 		FlowRef:      ref,
 		KratosFlowID: flow.ID,
 		Kind:         string(kind),
 		Email:        email,
+		Username:     username,
 	}
 	if err := s.store.SaveFlow(ctx, rec); err != nil {
 		return "", err
@@ -299,7 +337,7 @@ func (s *Server) sessionResponse(c *fiber.Ctx) error {
 		}).Warn("session check: whoami failed")
 		return c.JSON(fiber.Map{"authenticated": false})
 	}
-	user, err := s.store.GetOrCreateUser(c.Context(), session.Identity.ID, kratosx.TraitString(session.Identity.Traits, "email"))
+	user, err := s.store.GetOrCreateUser(c.Context(), session.Identity.ID, kratosx.PrimaryContact(session.Identity.Traits))
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -322,12 +360,14 @@ func (s *Server) sessionResponse(c *fiber.Ctx) error {
 		}
 	}
 	amr := kratosx.MethodsUsed(session)
+	traitsEmail := kratosx.TraitString(session.Identity.Traits, "email")
+	traitsUsername := kratosx.TraitString(session.Identity.Traits, "username")
 	claims := token.Claims{
 		KratosIdentityID: session.Identity.ID,
 		AAL:              session.AuthenticatorAssuranceLevel,
 		AMR:              amr,
 		LinkedMethods:    linked,
-		Email:            kratosx.TraitString(session.Identity.Traits, "email"),
+		Email:            traitsEmail,
 		GoogleEmail:      kratosx.TraitString(session.Identity.Traits, "google_email"),
 		TelegramID:       kratosx.TraitString(session.Identity.Traits, "telegram_id"),
 	}
@@ -338,7 +378,8 @@ func (s *Server) sessionResponse(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"authenticated":  true,
 		"user_id":        user.UserID,
-		"email":          claims.Email,
+		"email":          traitsEmail,
+		"username":       traitsUsername,
 		"aal":            session.AuthenticatorAssuranceLevel,
 		"methods_used":   amr,
 		"linked_methods": linked,
@@ -388,8 +429,12 @@ func (s *Server) handleEmailOTPStart(c *fiber.Ctx) error {
 		return c.Status(500).JSON(fiber.Map{"error": "start flow failed"})
 	}
 	body := map[string]any{"method": "code", "identifier": req.Email}
+	username := kratosx.UsernameFromEmail(req.Email)
 	if kind == kratosx.FlowRegistration {
-		body = map[string]any{"method": "code", "traits": map[string]string{"email": req.Email}}
+		if username == "" {
+			username = fmt.Sprintf("user-%s", uuid.NewString()[:8])
+		}
+		body = map[string]any{"method": "code", "traits": map[string]string{"email": req.Email, "username": username}}
 	}
 	sub, err := s.kratos.SubmitFlow(c.Context(), kind, res.Flow.ID, body, s.kratosToken(c))
 	if err != nil {
@@ -399,7 +444,7 @@ func (s *Server) handleEmailOTPStart(c *fiber.Ctx) error {
 	if flow == nil {
 		flow = res.Flow
 	}
-	ref, err := s.saveFlowRef(c.Context(), kind, flow, req.Email)
+	ref, err := s.saveFlowRef(c.Context(), kind, flow, req.Email, username)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -421,7 +466,14 @@ func (s *Server) handleEmailOTPVerify(c *fiber.Ctx) error {
 	kind := kratosx.FlowKind(rec.Kind)
 	body := map[string]any{"method": "code", "code": req.Code}
 	if kind == kratosx.FlowRegistration {
-		body["traits"] = map[string]string{"email": rec.Email}
+		username := rec.Username
+		if username == "" {
+			username = kratosx.UsernameFromEmail(rec.Email)
+		}
+		if username == "" {
+			username = fmt.Sprintf("user-%s", uuid.NewString()[:8])
+		}
+		body["traits"] = map[string]string{"email": rec.Email, "username": username}
 	} else {
 		body["identifier"] = rec.Email
 	}
@@ -438,12 +490,12 @@ func (s *Server) handleEmailOTPVerify(c *fiber.Ctx) error {
 
 func (s *Server) handlePasskeyRegisterStart(c *fiber.Ctx) error {
 	var req struct {
-		Email string `json:"email"`
+		Username string `json:"username"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
 	}
-	req.Email = strings.TrimSpace(req.Email)
+	req.Username = strings.TrimSpace(req.Username)
 	res, err := s.kratos.StartFlow(c.Context(), kratosx.FlowRegistration, s.kratosToken(c), nil)
 	if err != nil || res.Flow == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "start flow failed"})
@@ -452,7 +504,7 @@ func (s *Server) handlePasskeyRegisterStart(c *fiber.Ctx) error {
 	if !ok {
 		return c.Status(500).JSON(fiber.Map{"error": "passkey_create_data missing"})
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowRegistration, res.Flow, req.Email)
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowRegistration, res.Flow, "", req.Username)
 	var parsed any
 	_ = json.Unmarshal([]byte(opts), &parsed)
 	return c.JSON(fiber.Map{"flow_ref": ref, "creation_options": parsed})
@@ -462,7 +514,7 @@ func (s *Server) handlePasskeyRegisterFinish(c *fiber.Ctx) error {
 	var req struct {
 		FlowRef    string          `json:"flow_ref"`
 		Credential json.RawMessage `json:"credential"`
-		Email      string          `json:"email"`
+		Username   string          `json:"username"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid body"})
@@ -477,8 +529,8 @@ func (s *Server) handlePasskeyRegisterFinish(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
 	}
 	body["passkey_register"] = cred
-	email := passkeyTraitsEmail(req.Email, rec.Email)
-	body["traits"] = map[string]string{"email": email}
+	username := passkeyTraitsUsername(req.Username, rec.Username)
+	body["traits"] = map[string]string{"username": username}
 	sub, err := s.kratos.SubmitFlow(c.Context(), kratosx.FlowRegistration, rec.KratosFlowID, body, s.kratosToken(c))
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
@@ -499,7 +551,7 @@ func (s *Server) handlePasskeyLoginStart(c *fiber.Ctx) error {
 	if !ok {
 		return c.Status(500).JSON(fiber.Map{"error": "passkey_challenge missing"})
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "")
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "", "")
 	var parsed any
 	_ = json.Unmarshal([]byte(opts), &parsed)
 	return c.JSON(fiber.Map{"flow_ref": ref, "request_options": parsed})
@@ -547,21 +599,58 @@ func (s *Server) handleOIDCStart(c *fiber.Ctx) error {
 	if req.Intent == "" {
 		req.Intent = "login"
 	}
+	return s.startOIDCFlow(c, provider, req.Intent)
+}
+
+func (s *Server) handleStepUpGoogleStart(c *fiber.Ctx) error {
+	return s.startOIDCFlow(c, "google", "stepup")
+}
+
+func (s *Server) startOIDCFlow(c *fiber.Ctx, provider, intent string) error {
 	kind := kratosx.FlowLogin
-	switch req.Intent {
+	token := s.kratosToken(c)
+	switch intent {
 	case "register":
 		kind = kratosx.FlowRegistration
 	case "link":
 		kind = kratosx.FlowSettings
+	case "stepup":
+		if token == "" {
+			return c.Status(401).JSON(fiber.Map{
+				"error": "sign in first",
+				"hint":  "Link Google under Linked methods first if this account has no Google credential.",
+			})
+		}
+		kind = kratosx.FlowLogin
 	}
 
-	token := s.kratosToken(c)
 	query := url.Values{}
 	var ctxID string
+	browserStepUp := intent == "stepup"
 
 	if kind == kratosx.FlowSettings {
 		if token == "" {
 			return c.Status(401).JSON(fiber.Map{"error": "login required to link provider"})
+		}
+	} else if browserStepUp {
+		// Refresh login with an existing API session: Kratos does not issue
+		// session_token_exchange_code (see login/handler.go). Use browser flow +
+		// return_to redirect instead, forwarding continuity cookies like OIDC link.
+		ctxID = uuid.NewString()
+		query.Set("return_to", fmt.Sprintf("%s/api/v1/auth/oidc/stepup/done?ctx=%s", s.cfg.PublicBaseURL, ctxID))
+		query.Set("refresh", "true")
+		priorSession, err := s.kratos.WhoAmI(c.Context(), token)
+		if err != nil {
+			return c.Status(401).JSON(fiber.Map{"error": "not authenticated"})
+		}
+		if err := s.store.SaveOIDCContext(c.Context(), store.OIDCContext{
+			CtxID:             ctxID,
+			Intent:            intent,
+			PriorSessionToken: token,
+			PriorSessionID:    priorSession.ID,
+			StepUpProvider:    provider,
+		}); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "save step-up context failed"})
 		}
 	} else {
 		ctxID = uuid.NewString()
@@ -571,23 +660,33 @@ func (s *Server) handleOIDCStart(c *fiber.Ctx) error {
 	}
 
 	logFields := logrus.Fields{
-		"provider": provider,
-		"intent":   req.Intent,
-		"kind":     kind,
-		"ctx_id":   ctxID,
-		"flow":     "oidc_start",
+		"provider":       provider,
+		"intent":         intent,
+		"kind":           kind,
+		"ctx_id":         ctxID,
+		"flow":           "oidc_start",
+		"browser_stepup": browserStepUp,
 	}
 
-	res, err := s.kratos.StartFlow(c.Context(), kind, token, query)
+	var res *kratosx.SubmitResult
+	var err error
+	if browserStepUp {
+		res, err = s.kratos.StartBrowserFlow(c.Context(), kind, token, query)
+	} else {
+		res, err = s.kratos.StartFlow(c.Context(), kind, token, query)
+	}
 	if err != nil || res.Flow == nil {
 		s.log.WithFields(logFields).WithError(err).Error("oidc start flow failed")
 		return c.Status(500).JSON(fiber.Map{"error": "start flow failed", "debug": logFields})
 	}
+	if intent == "link" || browserStepUp {
+		cookies.ApplySetCookies(c, res.SetCookies)
+	}
 	logFields["kratos_flow_id"] = res.Flow.ID
 
-	initCode := kratosx.ExtractExchangeInitCode(res)
-	logFields["init_code_present"] = initCode != ""
-	if kind != kratosx.FlowSettings {
+	if kind != kratosx.FlowSettings && !browserStepUp {
+		initCode := kratosx.ExtractExchangeInitCode(res)
+		logFields["init_code_present"] = initCode != ""
 		if initCode == "" {
 			s.log.WithFields(logFields).Error("oidc init code missing from kratos flow")
 			return c.Status(500).JSON(fiber.Map{
@@ -596,17 +695,22 @@ func (s *Server) handleOIDCStart(c *fiber.Ctx) error {
 			})
 		}
 		if err := s.store.SaveOIDCContext(c.Context(), store.OIDCContext{
-			CtxID: ctxID, InitCode: initCode, Intent: req.Intent,
+			CtxID: ctxID, InitCode: initCode, Intent: intent,
 		}); err != nil {
 			s.log.WithFields(logFields).WithError(err).Error("oidc context save failed")
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
 	}
 
-	upstream := oidcUpstreamParams(provider, req.Intent)
+	upstream := oidcUpstreamParams(provider, intent)
 	body := map[string]any{"method": "oidc", "provider": provider}
-	if req.Intent == "link" {
+	if intent == "link" {
 		body = map[string]any{"method": "oidc", "link": provider}
+	}
+	if browserStepUp {
+		if csrf, ok := kratosx.NodeValue(res.Flow, "csrf_token"); ok {
+			body["csrf_token"] = csrf
+		}
 	}
 	if len(upstream) > 0 {
 		body["upstream_parameters"] = upstream
@@ -621,6 +725,9 @@ func (s *Server) handleOIDCStart(c *fiber.Ctx) error {
 	logFields["kratos_status"] = sub.Status
 	logFields["error_id"] = sub.ErrorID
 
+	if sub.RedirectBrowserTo == "" {
+		sub.RedirectBrowserTo = kratosx.ExtractRedirectBrowserTo(sub)
+	}
 	if sub.RedirectBrowserTo == "" {
 		s.log.WithFields(logFields).Error("oidc submit returned no redirect")
 		return c.Status(500).JSON(fiber.Map{
@@ -653,10 +760,110 @@ func (s *Server) handleOIDCStart(c *fiber.Ctx) error {
 	logFields["redirect_host"] = hostFromURL(redirect)
 	s.log.WithFields(logFields).Info("oidc redirect ready")
 
-	return c.JSON(fiber.Map{
-		"redirect_url": redirect,
-		"debug":        logFields,
-	})
+	if intent == "link" || browserStepUp {
+		cookies.ApplySetCookies(c, sub.SetCookies)
+	}
+	out := fiber.Map{"redirect_url": redirect, "debug": logFields}
+	if intent == "stepup" {
+		out["hint"] = "Complete Google sign-in; session methods_used should include oidc:google."
+	}
+	return c.JSON(out)
+}
+
+// handleOIDCStepUpDone is the browser return_to target after Google OIDC step-up (refresh login).
+// Kratos ProcessLogin creates a separate OIDC-only session; merge oidc into the prior API session.
+func (s *Server) handleOIDCStepUpDone(c *fiber.Ctx) error {
+	ctxID := c.Query("ctx")
+	logFields := logrus.Fields{"flow": "oidc_stepup_done", "ctx_id": ctxID}
+
+	token := s.kratosToken(c)
+	if ctxID != "" {
+		oidcCtx, err := s.store.GetOIDCContext(c.Context(), ctxID)
+		if err != nil {
+			s.log.WithFields(logFields).WithError(err).Warn("oidc step-up context lookup failed")
+			return c.Redirect("/?oidc_error=stepup_ctx_missing")
+		}
+		if oidcCtx.PriorSessionToken != "" {
+			token = oidcCtx.PriorSessionToken
+		}
+		logFields["prior_session_id"] = oidcCtx.PriorSessionID
+		logFields["stepup_provider"] = oidcCtx.StepUpProvider
+
+		if err := s.mergeOIDCStepUp(c.Context(), *oidcCtx); err != nil {
+			s.log.WithFields(logFields).WithError(err).Warn("oidc step-up session merge failed")
+		}
+		_ = s.store.DeleteOIDCContext(c.Context(), ctxID)
+	}
+
+	logFields["token_present"] = token != ""
+	if token == "" {
+		s.log.WithFields(logFields).Warn("oidc step-up done without session token")
+		return c.Redirect("/?oidc_error=stepup_no_session")
+	}
+
+	session, err := s.kratos.WhoAmI(c.Context(), token)
+	if err != nil {
+		s.log.WithFields(logFields).WithError(err).Warn("oidc step-up done whoami failed")
+		return c.Redirect("/?oidc_error=stepup_whoami_failed")
+	}
+	logFields["methods_used"] = kratosx.MethodsUsed(session)
+	s.log.WithFields(logFields).Info("oidc step-up done")
+	cookies.SetSessionToken(c, s.cfg.PublicBaseURL, token)
+	c.Set("Content-Type", "text/html; charset=utf-8")
+	return c.SendString(oidcReturnHTML(token, "stepup"))
+}
+
+func (s *Server) mergeOIDCStepUp(ctx context.Context, oidcCtx store.OIDCContext) error {
+	if oidcCtx.PriorSessionID == "" || oidcCtx.StepUpProvider == "" {
+		return fmt.Errorf("incomplete step-up context")
+	}
+	if s.cfg.KratosDSN == "" {
+		return fmt.Errorf("KRATOS_DSN required for OIDC step-up merge")
+	}
+
+	provider := oidcCtx.StepUpProvider
+	method := sessionmerge.AuthMethod{
+		Method:      "oidc",
+		AAL:         "aal1",
+		Provider:    provider,
+		CompletedAt: time.Now().UTC(),
+	}
+
+	prior, err := s.kratos.WhoAmI(ctx, oidcCtx.PriorSessionToken)
+	if err != nil {
+		return fmt.Errorf("prior whoami: %w", err)
+	}
+	if kratosx.HasAuthMethod(prior, "oidc", provider) {
+		return nil
+	}
+
+	var orphanID string
+	if sessions, err := s.kratos.ListIdentitySessions(ctx, prior.Identity.ID); err == nil {
+		for _, sess := range sessions {
+			if sess.ID == oidcCtx.PriorSessionID || !sess.Active {
+				continue
+			}
+			if kratosx.HasAuthMethod(&kratosx.WhoAmI{AuthenticationMethods: sess.AuthenticationMethods}, "oidc", provider) {
+				orphanID = sess.ID
+				for _, m := range sess.AuthenticationMethods {
+					if m.Method == "oidc" && m.Provider == provider {
+						method.CompletedAt = m.CompletedAt
+						break
+					}
+				}
+				break
+			}
+		}
+	}
+
+	appended, err := sessionmerge.AppendMethod(ctx, s.cfg.KratosDSN, oidcCtx.PriorSessionID, method)
+	if err != nil {
+		return err
+	}
+	if appended && orphanID != "" {
+		_ = s.kratos.RevokeSession(ctx, orphanID)
+	}
+	return nil
 }
 
 func (s *Server) handleOIDCReturn(c *fiber.Ctx) error {
@@ -696,7 +903,11 @@ func (s *Server) handleOIDCReturn(c *fiber.Ctx) error {
 	s.log.WithFields(logFields).Info("oidc token exchange succeeded")
 	cookies.SetSessionToken(c, s.cfg.PublicBaseURL, ex.SessionToken)
 	c.Set("Content-Type", "text/html; charset=utf-8")
-	return c.SendString(oidcReturnHTML(ex.SessionToken))
+	oidcResult := "ok"
+	if oidcCtx.Intent == "stepup" {
+		oidcResult = "stepup"
+	}
+	return c.SendString(oidcReturnHTML(ex.SessionToken, oidcResult))
 }
 
 func (s *Server) handleMethods(c *fiber.Ctx) error {
@@ -765,7 +976,7 @@ func (s *Server) handlePasskeyLinkStart(c *fiber.Ctx) error {
 	if !ok {
 		return c.Status(403).JSON(fiber.Map{"error_id": res.ErrorID, "hint": "session_refresh_required?"})
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowSettings, res.Flow, "")
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowSettings, res.Flow, "", "")
 	var parsed any
 	_ = json.Unmarshal([]byte(opts), &parsed)
 	return c.JSON(fiber.Map{"flow_ref": ref, "creation_options": parsed})
@@ -816,6 +1027,141 @@ func (s *Server) handlePasskeyRemove(c *fiber.Ctx) error {
 	return s.sessionResponse(c)
 }
 
+func (s *Server) handleEmailOTPLinkStart(c *fiber.Ctx) error {
+	token := s.kratosToken(c)
+	if token == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "sign in first"})
+	}
+	var req struct {
+		Email string `json:"email"`
+	}
+	if err := c.BodyParser(&req); err != nil || strings.TrimSpace(req.Email) == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "email required"})
+	}
+	req.Email = strings.TrimSpace(req.Email)
+
+	session, err := s.kratos.WhoAmI(c.Context(), token)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "not authenticated"})
+	}
+	admin, _ := s.kratos.GetAdminIdentity(c.Context(), session.Identity.ID)
+	if kratosx.HasLinkedMethod(admin, "email_otp") {
+		return c.Status(409).JSON(fiber.Map{
+			"error": "email OTP already linked",
+			"hint":  "This identity already has an email OTP address.",
+		})
+	}
+
+	// Settings profile update is identity-aware and triggers courier to the NEW address.
+	// Standalone verification flow treats the address as "unknown" and sends no OTP (was_notified=false).
+	res, err := s.kratos.StartFlow(c.Context(), kratosx.FlowSettings, token, nil)
+	if err != nil || res.Flow == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "start settings flow failed", "error_id": res.ErrorID})
+	}
+	if res.ErrorID == "session_refresh_required" {
+		return c.Status(403).JSON(fiber.Map{
+			"error_id": res.ErrorID,
+			"hint":     "Click Re-auth (refresh) under Step-up, then retry Link email OTP.",
+		})
+	}
+
+	sub, err := s.kratos.SubmitFlow(c.Context(), kratosx.FlowSettings, res.Flow.ID, map[string]any{
+		"method": "profile",
+		"traits": profileTraitsForUpdate(session.Identity.Traits, req.Email),
+	}, token)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if verFlowID, _, ok := kratosx.ContinueWithVerification(sub); ok {
+		ref, err := s.saveFlowRef(c.Context(), kratosx.FlowVerification, &kratosx.FlowResponse{ID: verFlowID}, req.Email, kratosx.TraitString(session.Identity.Traits, "username"))
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"flow_ref":           ref,
+			"needs_verification": true,
+			"email":              req.Email,
+			"messages":           kratosx.FlowMessages(sub.Flow),
+			"hint":               "OTP sent via settings profile update — check Last OTP or auth-service log otp_code=…",
+		})
+	}
+
+	flow := sub.Flow
+	if flow == nil {
+		flow = res.Flow
+	}
+	if kratosx.FlowAwaitingCode(flow) {
+		ref, err := s.saveFlowRef(c.Context(), kratosx.FlowSettings, flow, req.Email, kratosx.TraitString(session.Identity.Traits, "username"))
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+		return c.JSON(fiber.Map{
+			"flow_ref":           ref,
+			"needs_verification": true,
+			"email":              req.Email,
+			"messages":           kratosx.FlowMessages(flow),
+			"hint":               "Enter the verification code below.",
+		})
+	}
+
+	if sub.Status == http.StatusOK {
+		s.persistSessionToken(c, sub)
+		return s.sessionResponse(c)
+	}
+
+	return c.Status(sub.Status).JSON(fiber.Map{
+		"error_id": sub.ErrorID,
+		"flow":     sub.Flow,
+		"messages": kratosx.FlowMessages(sub.Flow),
+		"hint":     "Profile update did not enter verification — try Re-auth (refresh) and retry.",
+	})
+}
+
+func (s *Server) handleEmailOTPLinkVerify(c *fiber.Ctx) error {
+	token := s.kratosToken(c)
+	if token == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "sign in first"})
+	}
+	var req struct {
+		FlowRef string `json:"flow_ref"`
+		Code    string `json:"code"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Code == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "flow_ref and code required"})
+	}
+	rec, err := s.store.GetFlow(c.Context(), req.FlowRef)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	kind := kratosx.FlowKind(rec.Kind)
+	body := map[string]any{"method": "code", "code": req.Code}
+	switch kind {
+	case kratosx.FlowSettings:
+		body["traits"] = profileTraitsForUpdate(map[string]any{
+			"username": rec.Username,
+		}, rec.Email)
+	case kratosx.FlowVerification:
+		if rec.Email != "" {
+			body["email"] = rec.Email
+		}
+	}
+	sub, err := s.kratos.SubmitFlow(c.Context(), kind, rec.KratosFlowID, body, token)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	if sub.Status != http.StatusOK {
+		return c.Status(sub.Status).JSON(fiber.Map{
+			"error_id": sub.ErrorID,
+			"flow":     sub.Flow,
+			"messages": kratosx.FlowMessages(sub.Flow),
+		})
+	}
+
+	s.persistSessionToken(c, sub)
+	return s.sessionResponse(c)
+}
+
 func (s *Server) handleOIDCUnlink(c *fiber.Ctx) error {
 	provider := c.Params("provider")
 	res, err := s.kratos.StartFlow(c.Context(), kratosx.FlowSettings, s.kratosToken(c), nil)
@@ -862,7 +1208,7 @@ func (s *Server) handleTOTPStart(c *fiber.Ctx) error {
 	if n := kratosx.NodeByName(res.Flow, "totp_qr"); n != nil {
 		qr = n.Attributes.Src
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowSettings, res.Flow, "")
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowSettings, res.Flow, "", "")
 	return c.JSON(fiber.Map{"flow_ref": ref, "secret": secret, "qr_data_uri": qr})
 }
 
@@ -909,7 +1255,7 @@ func (s *Server) handleStepUpAAL2Start(c *fiber.Ctx) error {
 	if err != nil || res.Flow == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "start step-up flow failed"})
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "")
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "", "")
 	return c.JSON(fiber.Map{"flow_ref": ref, "available": []string{"totp"}})
 }
 
@@ -941,7 +1287,7 @@ func (s *Server) handleStepUpRefreshStart(c *fiber.Ctx) error {
 	if err != nil || res.Flow == nil {
 		return c.Status(500).JSON(fiber.Map{"error": "start refresh flow failed"})
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "")
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "", "")
 	return c.JSON(fiber.Map{"flow_ref": ref, "message": "complete any 1FA using login endpoints"})
 }
 
@@ -960,7 +1306,7 @@ func (s *Server) handleStepUpPasskeyStart(c *fiber.Ctx) error {
 	if !ok {
 		return c.Status(500).JSON(fiber.Map{"error": "passkey_challenge missing — add a passkey under Linked methods first"})
 	}
-	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "")
+	ref, _ := s.saveFlowRef(c.Context(), kratosx.FlowLogin, res.Flow, "", "")
 	var parsed any
 	_ = json.Unmarshal([]byte(opts), &parsed)
 	return c.JSON(fiber.Map{
@@ -968,6 +1314,100 @@ func (s *Server) handleStepUpPasskeyStart(c *fiber.Ctx) error {
 		"request_options": parsed,
 		"hint":            "Complete Touch ID, then call /api/v1/policy/demo-sensitive to verify amr includes oidc:google and passkey.",
 	})
+}
+
+// handleStepUpEmailOTPStart re-authenticates the current session with email OTP (refresh login flow).
+func (s *Server) handleStepUpEmailOTPStart(c *fiber.Ctx) error {
+	token := s.kratosToken(c)
+	if token == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "sign in first"})
+	}
+	var req struct {
+		Email string `json:"email"`
+	}
+	_ = c.BodyParser(&req)
+
+	session, err := s.kratos.WhoAmI(c.Context(), token)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "not authenticated"})
+	}
+	email := strings.TrimSpace(req.Email)
+	if email == "" {
+		email = kratosx.LinkedEmailAddress(session.Identity.Traits, nil)
+	}
+	if email == "" {
+		admin, _ := s.kratos.GetAdminIdentity(c.Context(), session.Identity.ID)
+		email = kratosx.LinkedEmailAddress(session.Identity.Traits, admin)
+	}
+	if email == "" {
+		return c.Status(400).JSON(fiber.Map{
+			"error": "no linked email OTP address",
+			"hint":  "Link email OTP under Linked methods first, or pass {\"email\":\"you@example.com\"}.",
+		})
+	}
+
+	q := url.Values{"refresh": []string{"true"}}
+	res, err := s.kratos.StartFlow(c.Context(), kratosx.FlowLogin, token, q)
+	if err != nil || res.Flow == nil {
+		return c.Status(500).JSON(fiber.Map{"error": "start email OTP step-up failed", "error_id": res.ErrorID})
+	}
+	sub, err := s.kratos.SubmitFlow(c.Context(), kratosx.FlowLogin, res.Flow.ID, map[string]any{
+		"method": "code", "identifier": email,
+	}, token)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	flow := sub.Flow
+	if flow == nil {
+		flow = res.Flow
+	}
+	ref, err := s.saveFlowRef(c.Context(), kratosx.FlowLogin, flow, email, "")
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{
+		"flow_ref": ref,
+		"email":    email,
+		"state":    flow.State,
+		"needs_code": true,
+		"hint":     "OTP is login_code — check Step-up Last OTP below or docker logs otp_code=…",
+	})
+}
+
+func (s *Server) handleStepUpEmailOTPVerify(c *fiber.Ctx) error {
+	token := s.kratosToken(c)
+	if token == "" {
+		return c.Status(401).JSON(fiber.Map{"error": "sign in first"})
+	}
+	var req struct {
+		FlowRef string `json:"flow_ref"`
+		Code    string `json:"code"`
+	}
+	if err := c.BodyParser(&req); err != nil || req.Code == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "flow_ref and code required"})
+	}
+	rec, err := s.store.GetFlow(c.Context(), req.FlowRef)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": err.Error()})
+	}
+	if kratosx.FlowKind(rec.Kind) != kratosx.FlowLogin {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid flow_ref for email step-up"})
+	}
+	sub, err := s.kratos.SubmitFlow(c.Context(), kratosx.FlowLogin, rec.KratosFlowID, map[string]any{
+		"method": "code", "code": req.Code, "identifier": rec.Email,
+	}, token)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	s.persistSessionToken(c, sub)
+	if sub.Status != http.StatusOK {
+		return c.Status(sub.Status).JSON(fiber.Map{
+			"error_id": sub.ErrorID,
+			"flow":     sub.Flow,
+			"messages": kratosx.FlowMessages(sub.Flow),
+		})
+	}
+	return s.sessionResponse(c)
 }
 
 // handlePolicyDemoSensitive example policy: both Google OIDC and passkey must appear in this session's AMR.
@@ -984,7 +1424,7 @@ func (s *Server) handlePolicyDemoSensitive(c *fiber.Ctx) error {
 			"required": required,
 			"methods_used": used,
 			"aal":      session.AuthenticatorAssuranceLevel,
-			"hint":     "Login with Google, then Step-up → Passkey, then retry. Note: Google+passkey stays aal1; use TOTP step-up for aal2.",
+			"hint":     "Need both oidc:google and passkey in methods_used: Login Google → Step up passkey, or passkey login → Step up Google. Note: both stay aal1; use TOTP step-up for aal2.",
 		})
 	}
 	return c.JSON(fiber.Map{
@@ -1060,6 +1500,9 @@ func (s *Server) reverseProxy(c *fiber.Ctx, targetURL string) error {
 	if token := s.kratosToken(c); token != "" {
 		req.Header.Set("X-Session-Token", token)
 	}
+	if browserCookie := c.Get("Cookie"); browserCookie != "" {
+		req.Header.Set("Cookie", browserCookie)
+	}
 	for k, v := range c.GetReqHeaders() {
 		if len(v) > 0 && strings.EqualFold(k, "Content-Type") {
 			req.Header.Set(k, v[0])
@@ -1086,6 +1529,7 @@ func (s *Server) reverseProxy(c *fiber.Ctx, targetURL string) error {
 			c.Set(k, v)
 		}
 	}
+	cookies.ApplySetCookies(c, resp.Cookies())
 	body, _ := io.ReadAll(resp.Body)
 	return c.Send(body)
 }
@@ -1130,16 +1574,65 @@ func hostFromURL(raw string) string {
 	return u.Host
 }
 
-// passkeyTraitsEmail returns the identity email trait for passkey registration.
-// Kratos requires the email trait in schema; generate a placeholder when omitted.
-func passkeyTraitsEmail(requested, stored string) string {
-	if e := strings.TrimSpace(requested); e != "" {
-		return e
+func otpFromPayload(payload map[string]any) string {
+	if payload == nil {
+		return ""
 	}
-	if e := strings.TrimSpace(stored); e != "" {
-		return e
+	for _, key := range []string{"verification_code", "login_code", "registration_code", "recovery_code"} {
+		if v, ok := payload[key].(string); ok && v != "" {
+			return v
+		}
 	}
-	return fmt.Sprintf("passkey+%s@passkeys.local", uuid.NewString()[:8])
+	if td, ok := payload["template_data"].(map[string]any); ok {
+		for _, key := range []string{"verification_code", "login_code", "registration_code", "recovery_code"} {
+			if v, ok := td[key].(string); ok && v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func otpCodeType(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	for _, key := range []string{"verification_code", "login_code", "registration_code", "recovery_code"} {
+		if v, ok := payload[key].(string); ok && v != "" {
+			return key
+		}
+	}
+	if td, ok := payload["template_data"].(map[string]any); ok {
+		for _, key := range []string{"verification_code", "login_code", "registration_code", "recovery_code"} {
+			if v, ok := td[key].(string); ok && v != "" {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
+// profileTraitsForUpdate builds a valid traits payload for settings profile (schema requires username).
+func profileTraitsForUpdate(existing map[string]any, email string) map[string]string {
+	traits := map[string]string{}
+	if u := kratosx.TraitString(existing, "username"); u != "" {
+		traits["username"] = u
+	}
+	if email != "" {
+		traits["email"] = email
+	}
+	return traits
+}
+
+// passkeyTraitsUsername returns the identity username trait for passkey registration.
+func passkeyTraitsUsername(requested, stored string) string {
+	if u := strings.TrimSpace(requested); u != "" {
+		return u
+	}
+	if u := strings.TrimSpace(stored); u != "" {
+		return u
+	}
+	return fmt.Sprintf("user-%s", uuid.NewString()[:8])
 }
 
 // passkeyCredentialPayload returns the raw WebAuthn JSON string Kratos expects.
@@ -1162,16 +1655,20 @@ func passkeyCredentialPayload(raw json.RawMessage) (string, error) {
 	}
 }
 
-func oidcReturnHTML(sessionToken string) string {
+func oidcReturnHTML(sessionToken, result string) string {
+	if result == "" {
+		result = "ok"
+	}
 	// HTML bridge: persists token for the test console (sessionStorage + cookie)
 	// then redirects home. Avoids ngrok/proxy cookie issues in the PoC UI.
 	tokenJSON, _ := json.Marshal(sessionToken)
+	resultJSON, _ := json.Marshal(result)
 	return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Signing in…</title></head>
 <body><p>Signing you in…</p><script>
 try {
   sessionStorage.setItem('poc_kratos_session', ` + string(tokenJSON) + `);
 } catch (e) {}
-location.replace('/?oidc=ok');
+location.replace('/?oidc=' + ` + string(resultJSON) + `);
 </script></body></html>`
 }

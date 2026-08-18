@@ -1,6 +1,6 @@
 module github.com/hardy/kratos-poc2/auth-service
 
-go 1.22
+go 1.25
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.32.6
@@ -13,6 +13,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/ilyakaznacheev/cleanenv v1.5.0
 	github.com/joho/godotenv v1.5.1
+	github.com/lib/pq v1.10.9
 	github.com/sirupsen/logrus v1.9.3
 )
 

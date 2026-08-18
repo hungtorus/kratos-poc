@@ -7,6 +7,21 @@
     "traits": {
       "type": "object",
       "properties": {
+        "username": {
+          "type": "string",
+          "minLength": 1,
+          "title": "Username",
+          "ory.sh/kratos": {
+            "credentials": {
+              "passkey": {
+                "display_name": true
+              },
+              "webauthn": {
+                "identifier": true
+              }
+            }
+          }
+        },
         "email": {
           "type": "string",
           "format": "email",
@@ -17,12 +32,6 @@
               "code": {
                 "identifier": true,
                 "via": "email"
-              },
-              "passkey": {
-                "display_name": true
-              },
-              "totp": {
-                "account_name": true
               }
             },
             "verification": {
@@ -47,7 +56,7 @@
           "title": "Telegram Username"
         }
       },
-      "required": ["email"],
+      "required": ["username"],
       "additionalProperties": false
     }
   }
