@@ -27,8 +27,6 @@ The goal is agreement on five things:
 4. What has to change in authentication-api.
 5. What we have not solved yet.
 
-**Please comment inline.** Anything you disagree with, anything that reads as hand-waving, and anything you think is missing. The [Open Questions](#open-questions) section at the end is the intended landing zone for larger objections — if your comment changes the shape rather than the detail, add it there so it survives into the next revision.
-
 ---
 
 ## Context
@@ -67,13 +65,13 @@ Kratos runs **inside the internal network only**. Users must not know Kratos exi
 
 Five decisions, each expanded below.
 
-| #      | Decision                                                                                              | In one line                                                                                                                                                                      |
-| ------ | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **D1** | **authentication-api is a facade, not a proxy**                                                       | Every user-facing call terminates in authentication-api, which drives Kratos server-to-server over its native API. No Kratos identifier of any kind crosses the public boundary. |
-| **D2** | **Kratos sessions are internal, transient receipts**                                                  | The Kratos session token is held server-side and discarded. The session the user holds is authentication-api's, and it is the only one.                                          |
-| **D3** | **Each factor verification is an independent event, carried in the token we issue**                   | We do not try to accumulate factors inside a single Kratos session, and we do not read Kratos's AAL as the verdict.                                                              |
-| **D4** | **The login rule is evaluated by authentication-api**                                                 | "Two distinct linked factors of different types" is policy code in a service we control. Kratos's `aal1`/`aal2` is corroborating signal, never the decision.                     |
-| **D5** | **Kratos is the single source of truth for which factors a profile has**                              | authentication-api derives the factor set from Kratos on demand rather than mirroring it. No new table, and no second store to keep consistent.                                  |
+| #      | Decision                                                                            | In one line                                                                                                                                                                      |
+| ------ | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **D1** | **authentication-api is a facade, not a proxy**                                     | Every user-facing call terminates in authentication-api, which drives Kratos server-to-server over its native API. No Kratos identifier of any kind crosses the public boundary. |
+| **D2** | **Kratos sessions are internal, transient receipts**                                | The Kratos session token is held server-side and discarded. The session the user holds is authentication-api's, and it is the only one.                                          |
+| **D3** | **Each factor verification is an independent event, carried in the token we issue** | We do not try to accumulate factors inside a single Kratos session, and we do not read Kratos's AAL as the verdict.                                                              |
+| **D4** | **The login rule is evaluated by authentication-api**                               | "Two distinct linked factors of different types" is policy code in a service we control. Kratos's `aal1`/`aal2` is corroborating signal, never the decision.                     |
+| **D5** | **Kratos is the single source of truth for which factors a profile has**            | authentication-api derives the factor set from Kratos on demand rather than mirroring it. No new table, and no second store to keep consistent.                                  |
 
 ---
 
@@ -182,6 +180,8 @@ Three consequences follow immediately, and they are the reason to prefer this fr
 
 The one place Kratos sessions genuinely persist is **enrolment**: adding a passkey, enrolling TOTP or linking a provider all run through Kratos's settings flows, which require a live and recently-authenticated Kratos session. authentication-api holds that session server-side for the duration of the operation and discards it afterwards. Kratos's own "privileged session" freshness window becomes an implementation detail of our step-up requirement, not something the user ever sees.
 
+The scope of that is worth stating precisely, because it is narrower than "we now manage Kratos sessions". Login retains nothing — each verification is a fresh flow whose session is read and dropped. Only the enrolment ceremonies hold one, only across the two legs of a single ceremony, and only on the flow-state row that ceremony already needs for its Kratos flow ID. That row expires on its own within minutes. Kratos offers no administrative way to mint a session for an identity, so this cannot be avoided by re-authenticating per request — but there is no session lifecycle to track, refresh or revoke either.
+
 ---
 
 ## Flows
@@ -220,6 +220,8 @@ The important detail is what the two tokens are for. **`1fa_token` is an interme
 
 The policy check between the last two steps is the whole reason for Option 4. It asks: are both factors linked to the same profile, are they of different types, and are they different instances? It does not ask Kratos for an assurance level.
 
+One thing is deliberately absent from both tokens: **the Kratos session token itself.** Carrying it as a claim is tempting, because it would correlate the app token to a live Kratos session with no server-side state. The problem is that a JWT claim is encoded, not encrypted, and this JWT is client-visible by design — it is handed to the client and exchanged at Hydra. A claim containing `ory_st_…` therefore gives every holder of the token a working Kratos credential, and leaves copies of it in logs, client storage and any proxy along the way. It would also undo the constraint the whole design rests on, since the user would now possess the means to talk to Kratos directly. Where a later operation genuinely needs the Kratos session, the token carries an **opaque handle** to server-side flow state instead, and never the credential.
+
 ### Enrolment
 
 ```mermaid
@@ -238,9 +240,9 @@ sequenceDiagram
   A-->>C: factor enrolled
 ```
 
-Note what is absent: there is no reservation step and no local row to write. Kratos enforces that a factor identifier belongs to at most one identity, so a concurrent attempt to link the same Google account to a second profile is rejected by Kratos rather than by us. We surface that rejection; we do not try to predict it.
+Note what is absent: there is no reservation step and no local row to write. authentication-api does still run a pre-check before starting the flow — `credentials_identifier` resolves whether the factor is already mapped elsewhere, which is what lets us fail cleanly _before_ sending a browser off to Google rather than after. But that pre-check exists for the error message, not for correctness. Kratos enforces that a factor identifier belongs to at most one identity, so a concurrent link that slips between our check and our write is rejected by Kratos. We surface that rejection rather than building a protocol to prevent it.
 
-What Kratos has no opinion on is our own cardinality — exactly one OIDC provider fixed at account creation, at most one E-Mail OTP, several passkeys but never two passkeys as a login pair. Those are evaluated against the factor set read one step earlier, with a conditional write on the profile row to settle concurrent enrolments of *different* factors on the same profile.
+What Kratos has no opinion on is our own cardinality — exactly one OIDC provider fixed at account creation, at most one E-Mail OTP, several passkeys but never two passkeys as a login pair. Those are evaluated against the factor set read one step earlier, with a conditional write on the profile row to settle concurrent enrolments of _different_ factors on the same profile.
 
 ### The one flow where Kratos is visible: OIDC
 
@@ -271,7 +273,7 @@ Two things make this safe. First, Kratos's configured base URL means the `redire
 
 That second point deserves emphasis, because the tempting shortcut is a wildcard prefix that forwards anything under `/kratos/*`. A wildcard silently republishes the entire Kratos self-service API — including settings, where credentials are added and removed — to the internet, with authentication-api's own session context attached. It is a one-line mistake with total impact, and it is the single most important thing to get right in this design.
 
-Telegram needs an additional adapter regardless of the design, because its token signing keys include algorithms Kratos will not accept. A small broker between Kratos and Telegram — completing the real Telegram exchange and re-issuing a conforming token — resolves it. Whether we adopt that or keep Telegram's existing in-service implementation is an open question below.
+Telegram needs an additional adapter, and for a specific and time-bound reason. Telegram publishes an ES256K key in its JWKS, and Kratos fails to parse the **entire** key set when it encounters one — even though the ID token itself is RS256. That is an upstream bug ([ory/kratos#4572](https://github.com/ory/kratos/issues/4572), open), not a design constraint on our side. Until it is fixed, Kratos cannot consume Telegram directly, and a broker that completes the real Telegram exchange and re-issues a conforming token is required. Since authentication-api already implements Telegram login today, the cheaper path is to leave it there for now — the bug may well close before we would need the adapter.
 
 ---
 
@@ -296,19 +298,19 @@ An existing client library for Kratos's OTP flows is already present in the serv
 
 That is possible because Kratos's admin API answers almost everything a policy engine needs to ask:
 
-| Question | Answered by |
-|----------|-------------|
-| Which factors does this profile have? | The identity's `credentials` map: `oidc`, `passkey`, `totp`, `code` |
-| Which OIDC provider, and which subject? | `credentials.oidc.config.providers[]` — `provider` and `subject` |
-| How many passkeys, and which ones? | `credentials.passkey.config.credentials[]` — each with its own `id`, `added_at`, `display_name` |
-| Is Time OTP enrolled? | `credentials.totp.config.totp_url` is non-empty |
-| Which address backs E-Mail OTP? | `credentials.code.config.addresses[]` |
-| When was a factor enrolled? | `created_at` per credential type, `added_at` per passkey |
+| Question                                          | Answered by                                                                                                                                                                   |
+| ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Which factors does this profile have?             | The identity's `credentials` map: `oidc`, `passkey`, `totp`, `code`                                                                                                           |
+| Which OIDC provider, and which subject?           | `credentials.oidc.config.providers[]` — `provider` and `subject`                                                                                                              |
+| How many passkeys, and which ones?                | `credentials.passkey.config.credentials[]` — each with its own `id`, `added_at`, `display_name`                                                                               |
+| Is Time OTP enrolled?                             | `credentials.totp.config.totp_url` is non-empty                                                                                                                               |
+| Which address backs E-Mail OTP?                   | `credentials.code.config.addresses[]`                                                                                                                                         |
+| When was a factor enrolled?                       | `created_at` per credential type, `added_at` per passkey                                                                                                                      |
 | Is this factor already mapped to another profile? | `credentials.identifiers[]` are **globally unique**. Kratos rejects the duplicate link itself, and `GET /admin/identities?credentials_identifier=…` answers it as a pre-check |
-| Which profile owns this identity? | `identity.external_id`, which we set to our `profile_id`, with a direct lookup at `GET /admin/identities/by/external/{id}` |
-| Is a factor a first or second factor? | Not data at all — a fixed property of the Kratos strategy, so it is a constant in our code |
+| Which profile owns this identity?                 | `identity.external_id`, which we set to our `profile_id`, with a direct lookup at `GET /admin/identities/by/external/{id}`                                                    |
+| Is a factor a first or second factor?             | Not data at all — a fixed property of the Kratos strategy, so it is a constant in our code                                                                                    |
 
-Two of those fields carry more weight than the rest. **`external_id`** makes the identity carry our profile ID, with its own lookup route, so the profile ↔ identity mapping needs no table in either direction. And **`metadata_admin`** is writable only through the admin API — it appears in no self-service flow — so any policy metadata that genuinely must persist can live on the identity without being user-writable.
+Two of those fields carry more weight than the rest. **`external_id`** makes the Kratos identity carry our profile ID, with its own lookup route, so the identity ↔ profile mapping is resolvable in both directions without storing it — this is what removes the need for the dedicated mapping table the design would otherwise want. And **`metadata_admin`** is writable only through the admin API — it appears in no self-service flow — so any policy metadata that genuinely must persist can live on the identity without being user-writable.
 
 What remains on our side is a login attempt's own state. The 1FA→2FA correlation travels in the signed `1fa_token`, so it needs no storage. Two things do: a single-use challenge for sensitive actions, and a Kratos session token held across the two legs of a multi-step ceremony. Both are keyed, short-lived and consumed once — the shape of the `Nonces` table the service already has, where delete-on-read is already single-use.
 
@@ -347,13 +349,15 @@ erDiagram
     }
 ```
 
-The Kratos box is not a table we own or query — it is the identity document as the admin API returns it, drawn here to show where the factor set actually lives. Three rules govern how this is read and written:
+The Kratos box is not a table we own or query — it is the identity document as the admin API returns it, drawn here to show where the factor set actually lives. Four rules govern how this is read and written:
 
 **Derive, do not mirror.** The factor set is read from Kratos at the point of decision. Anything cached is an optimisation with a short TTL, invalidated on enrolment and removal, and never consulted for an authorization decision it could get wrong.
 
 **Identifiers come from credentials, never from identity attributes.** The link between a profile and a Google account must come from `credentials.oidc.config.providers[].subject`, not from an email or ID field on the identity. Those fields are user-writable through the settings flow, so a design that reads them lets one user claim another user's identifier and repoint the mapping at themselves. This is a rule, not a preference.
 
 **Let Kratos lose the race.** Concurrent attempts to link one factor to two profiles do not need a reservation protocol, because Kratos enforces credential-identifier uniqueness itself and will reject the loser. Our own cardinality rules — one OIDC provider per profile, one E-Mail OTP — are not Kratos rules, and are enforced with a conditional write on the existing `PROFILES` row.
+
+**A profile exists only once a social factor does.** Account creation always runs through OIDC, so the profile row and the `external_id` link are written at social registration and never before. A user who starts a passkey enrolment and abandons it leaves a Kratos identity with no profile and no `external_id` — inert, invisible to every profile lookup, and safe to reap on a schedule. The corollary matters more than the rule: nothing in the system may assume that every Kratos identity has a profile.
 
 Two costs come with this, and neither is bought off by adding a table. Every policy decision needs a read from Kratos — acceptable because it accompanies a verification call we are making anyway, but it does make Kratos load scale with authorization traffic. And because Kratos's admin API has no authentication of its own, a credential written straight into it would be indistinguishable from one we enrolled. A mirror table would not catch that, since the same code path that was tricked into enrolling would write the mirror too. The control that does catch it is an **append-only audit event** on every enrolment and removal, reconciled against Kratos on a schedule — detection in the event stream, which the service already publishes, rather than state on the hot path.
 
